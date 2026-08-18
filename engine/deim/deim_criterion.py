@@ -39,6 +39,10 @@ class DEIMCriterion(nn.Module):
         share_matched_indices=False,
         mal_alpha=None,
         use_uni_set=True,
+        qcmr_enabled=False,
+        qcmr_quality_loss_weight=0.25,
+        qcmr_quality_neg_weight=0.25,
+        qcmr_quality_target_gamma=1.0,
         ):
         """Create the criterion.
         Parameters:
@@ -64,6 +68,15 @@ class DEIMCriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
+        self.qcmr_enabled = qcmr_enabled
+        self.qcmr_quality_loss_weight = qcmr_quality_loss_weight
+        self.qcmr_quality_neg_weight = qcmr_quality_neg_weight
+        self.qcmr_quality_target_gamma = qcmr_quality_target_gamma
+        if self.qcmr_enabled:
+            if self.qcmr_quality_loss_weight < 0 or self.qcmr_quality_neg_weight < 0:
+                raise ValueError('QCMR quality loss weights must be non-negative.')
+            if self.qcmr_quality_target_gamma <= 0:
+                raise ValueError('qcmr_quality_target_gamma must be positive.')
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -214,6 +227,49 @@ class DEIMCriterion(nn.Module):
 
         return losses
 
+    def _qcmr_quality_loss(self, outputs, targets, indices):
+        """Supervise a class-agnostic quality logit with matched-box IoU."""
+        quality_logits = outputs['pred_quality']
+        if quality_logits.shape[-1] != 1:
+            raise ValueError('pred_quality must have shape [batch, queries, 1].')
+        quality_logits = quality_logits.squeeze(-1)
+
+        quality_targets = torch.zeros_like(quality_logits)
+        positive_mask = torch.zeros_like(quality_logits, dtype=torch.bool)
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel() > 0:
+            src_boxes = outputs['pred_boxes'][idx].detach()
+            target_boxes = torch.cat(
+                [target['boxes'][target_idx] for target, (_, target_idx) in zip(targets, indices)],
+                dim=0,
+            )
+            matched_iou, _ = box_iou(
+                box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+            matched_iou = torch.diag(matched_iou).clamp(0, 1)
+            matched_iou = matched_iou.pow(self.qcmr_quality_target_gamma)
+            quality_targets[idx] = matched_iou.to(quality_targets.dtype)
+            positive_mask[idx] = True
+
+        elementwise_loss = F.binary_cross_entropy_with_logits(
+            quality_logits, quality_targets, reduction='none')
+        zero = quality_logits.sum() * 0.0
+        positive_loss = elementwise_loss[positive_mask].mean() if positive_mask.any() else zero
+        negative_mask = ~positive_mask
+        negative_loss = elementwise_loss[negative_mask].mean() if negative_mask.any() else zero
+        return positive_loss + self.qcmr_quality_neg_weight * negative_loss
+
+    def loss_qcmr_quality(self, outputs, targets, indices):
+        return {
+            'loss_qcmr_quality': self.qcmr_quality_loss_weight
+            * self._qcmr_quality_loss(outputs, targets, indices)
+        }
+
+    def loss_qcmr_quality_enc(self, outputs, targets, indices):
+        return {
+            'loss_qcmr_quality_enc': self.qcmr_quality_loss_weight
+            * self._qcmr_quality_loss(outputs, targets, indices)
+        }
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -319,6 +375,11 @@ class DEIMCriterion(nn.Module):
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
 
+        # QCMR quality losses are intentionally outside self.losses so they are
+        # not repeated for decoder auxiliary, pre-head, or denoising outputs.
+        if self.qcmr_enabled and 'pred_quality' in outputs:
+            losses.update(self.loss_qcmr_quality(outputs, targets, indices))
+
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -375,6 +436,16 @@ class DEIMCriterion(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_enc_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+
+                if self.qcmr_enabled and 'pred_quality' in aux_outputs:
+                    quality_loss = self.loss_qcmr_quality_enc(
+                        aux_outputs, enc_targets, cached_indices_enc[i])
+                    # There is currently one selected-query encoder output. Keep
+                    # the canonical key stable if more encoder outputs are added.
+                    if i == 0:
+                        losses.update(quality_loss)
+                    else:
+                        losses.update({f'{key}_{i}': value for key, value in quality_loss.items()})
 
             if class_agnostic:
                 self.num_classes = orig_num_classes

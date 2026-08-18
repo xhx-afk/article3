@@ -13,26 +13,26 @@ __include__:
 
 # ==================== 用户可改配置区 ====================
 # 实验输出目录。
-output_dir: ./deim_outputs/deim_hgnetv2_l_wood_960_seed0
+output_dir: ./deim_outputs_origin_small_dataset/deim_hgnetv2_l_wood_960_seed1
 
 # Wood 数据集类别数，不包含背景类。
 num_classes: 9
 remap_mscoco_category: False
 
 # 训练总轮数。注意 DEIM 训练代码读取字段名 epoches，不是 D-FINE 的 epochs。
-epoches: 58 #25 #100
+epoches: 40 #58 #25 #100
 
 # DEIM 增强阶段节点。
-stage_start_epoch: &stage_start_epoch 4 #1 #4
-stage_middle_epoch: &stage_middle_epoch 29 #10 #40
+stage_start_epoch: &stage_start_epoch 3 #4 #1 #4
+stage_middle_epoch: &stage_middle_epoch 20 #29 #10 #40
 # 第几个 epoch 后关闭 Mosaic/光照扰动/随机扩图/IoU 裁剪/MixUp/多尺度。
-aug_stop_epoch: &aug_stop_epoch 50 #18 #72
+aug_stop_epoch: &aug_stop_epoch 34 #50 #18 #72
 
 # DEIM flatcosine 调度参数。
 # flat_epoch 通常取 4 + aug_stop_epoch / 2；aug_stop_epoch=72 时为 40。
 flat_epoch: *stage_middle_epoch
 # no_aug_epoch = epoches - aug_stop_epoch；100 - 72 = 28。
-no_aug_epoch: 8 #7 #28
+no_aug_epoch: 6 #8 #7 #28
 lr_gamma: 0.5
 
 # 训练和验证输入尺寸。评估尺寸必须和 val Resize 保持一致。

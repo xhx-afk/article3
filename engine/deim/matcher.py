@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from typing import Dict
 
-from .box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 
 from ..core import register
 import numpy as np
@@ -29,7 +29,10 @@ class HungarianMatcher(nn.Module):
 
     __share__ = ['use_focal_loss', ]
 
-    def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0):
+    def __init__(self, weight_dict, use_focal_loss=False, alpha=0.25, gamma=2.0,
+                 qcmr_quality_matching=False, qcmr_match_weight=0.25,
+                 qcmr_match_cls_alpha=1.0, qcmr_match_iou_beta=1.0,
+                 qcmr_match_pred_quality_beta=0.0, qcmr_eps=1e-6):
         """Creates the matcher
 
         Params:
@@ -45,6 +48,19 @@ class HungarianMatcher(nn.Module):
         self.use_focal_loss = use_focal_loss
         self.alpha = alpha
         self.gamma = gamma
+        self.qcmr_quality_matching = qcmr_quality_matching
+        self.qcmr_match_weight = qcmr_match_weight
+        self.qcmr_match_cls_alpha = qcmr_match_cls_alpha
+        self.qcmr_match_iou_beta = qcmr_match_iou_beta
+        self.qcmr_match_pred_quality_beta = qcmr_match_pred_quality_beta
+        self.qcmr_eps = qcmr_eps
+
+        if self.qcmr_quality_matching:
+            if min(self.qcmr_match_weight, self.qcmr_match_cls_alpha,
+                   self.qcmr_match_iou_beta, self.qcmr_match_pred_quality_beta) < 0:
+                raise ValueError('QCMR matching weights and exponents must be non-negative.')
+            if self.qcmr_eps <= 0:
+                raise ValueError('qcmr_eps must be positive.')
 
         assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs cant be 0"
 
@@ -87,12 +103,13 @@ class HungarianMatcher(nn.Module):
         # but approximate it in 1 - proba[target class].
         # The 1 is a constant that doesn't change the matching, it can be ommitted.
         if self.use_focal_loss:
-            out_prob = out_prob[:, tgt_ids]
-            neg_cost_class = (1 - self.alpha) * (out_prob ** self.gamma) * (-(1 - out_prob + 1e-8).log())
-            pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
+            class_prob_for_target = out_prob[:, tgt_ids]
+            neg_cost_class = (1 - self.alpha) * (class_prob_for_target ** self.gamma) * (-(1 - class_prob_for_target + 1e-8).log())
+            pos_cost_class = self.alpha * ((1 - class_prob_for_target) ** self.gamma) * (-(class_prob_for_target + 1e-8).log())
             cost_class = pos_cost_class - neg_cost_class
         else:
-            cost_class = -out_prob[:, tgt_ids]
+            class_prob_for_target = out_prob[:, tgt_ids]
+            cost_class = -class_prob_for_target
 
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
@@ -102,6 +119,22 @@ class HungarianMatcher(nn.Module):
 
         # Final cost matrix 3 * self.cost_bbox + 2 * self.cost_class + self.cost_giou
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        apply_qcmr = self.qcmr_quality_matching and outputs.get(
+            'qcmr_matching', 'pred_quality' in outputs)
+        if apply_qcmr:
+            pair_iou, _ = box_iou(
+                box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+            aligned_score = (
+                class_prob_for_target.clamp_min(self.qcmr_eps).pow(self.qcmr_match_cls_alpha)
+                * pair_iou.clamp(0, 1).pow(self.qcmr_match_iou_beta)
+            )
+            if self.qcmr_match_pred_quality_beta > 0 and 'pred_quality' in outputs:
+                pred_quality = outputs['pred_quality'].flatten(0, 1).sigmoid()
+                if pred_quality.shape[-1] != 1:
+                    raise ValueError('pred_quality must have shape [batch, queries, 1].')
+                aligned_score = aligned_score * pred_quality.pow(
+                    self.qcmr_match_pred_quality_beta)
+            C = C - self.qcmr_match_weight * aligned_score
         C = C.view(bs, num_queries, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]

@@ -10,6 +10,7 @@ DFINETransformer:
   qcmr_cls_alpha: 1.0
   qcmr_quality_beta: 0.5
   qcmr_eps: 1.0e-6
+  qcmr_quality_selection_start_epoch: 3
 
 DEIMCriterion:
   qcmr_enabled: true

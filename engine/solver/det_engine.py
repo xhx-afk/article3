@@ -21,11 +21,21 @@ from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
 
+def _set_qcmr_epoch(model, epoch):
+    """Propagate the training epoch without changing the model forward API."""
+    root = model.module if hasattr(model, 'module') else model
+    for module in root.modules():
+        setter = getattr(module, 'set_qcmr_epoch', None)
+        if callable(setter):
+            setter(epoch)
+
+
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
     model.train()
     criterion.train()
+    _set_qcmr_epoch(model, epoch)
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
@@ -88,6 +98,12 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
             optimizer.step()
 
+        debug_stats = getattr(criterion, 'qcmr_debug_stats', {})
+        if debug_stats:
+            debug_stats = dist_utils.reduce_dict(debug_stats)
+        else:
+            debug_stats = {}
+
         # ema
         if ema is not None:
             ema.update(model)
@@ -107,6 +123,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             sys.exit(1)
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced)
+        metric_logger.update(**debug_stats)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
@@ -115,6 +132,9 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+            for k, v in debug_stats.items():
+                tag = k[5:] if k.startswith('qcmr_') else k
+                writer.add_scalar(f'QCMR/{tag}', v.item(), global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

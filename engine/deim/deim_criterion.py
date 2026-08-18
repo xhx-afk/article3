@@ -72,6 +72,7 @@ class DEIMCriterion(nn.Module):
         self.qcmr_quality_loss_weight = qcmr_quality_loss_weight
         self.qcmr_quality_neg_weight = qcmr_quality_neg_weight
         self.qcmr_quality_target_gamma = qcmr_quality_target_gamma
+        self.qcmr_debug_stats = {}
         if self.qcmr_enabled:
             if self.qcmr_quality_loss_weight < 0 or self.qcmr_quality_neg_weight < 0:
                 raise ValueError('QCMR quality loss weights must be non-negative.')
@@ -236,6 +237,7 @@ class DEIMCriterion(nn.Module):
 
         quality_targets = torch.zeros_like(quality_logits)
         positive_mask = torch.zeros_like(quality_logits, dtype=torch.bool)
+        matched_iou_for_stats = quality_logits.new_empty(0)
         idx = self._get_src_permutation_idx(indices)
         if idx[0].numel() > 0:
             src_boxes = outputs['pred_boxes'][idx].detach()
@@ -246,8 +248,9 @@ class DEIMCriterion(nn.Module):
             matched_iou, _ = box_iou(
                 box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
             matched_iou = torch.diag(matched_iou).clamp(0, 1)
-            matched_iou = matched_iou.pow(self.qcmr_quality_target_gamma)
-            quality_targets[idx] = matched_iou.to(quality_targets.dtype)
+            matched_iou_for_stats = matched_iou
+            quality_targets[idx] = matched_iou.pow(
+                self.qcmr_quality_target_gamma).to(quality_targets.dtype)
             positive_mask[idx] = True
 
         elementwise_loss = F.binary_cross_entropy_with_logits(
@@ -256,13 +259,35 @@ class DEIMCriterion(nn.Module):
         positive_loss = elementwise_loss[positive_mask].mean() if positive_mask.any() else zero
         negative_mask = ~positive_mask
         negative_loss = elementwise_loss[negative_mask].mean() if negative_mask.any() else zero
-        return positive_loss + self.qcmr_quality_neg_weight * negative_loss
 
-    def loss_qcmr_quality(self, outputs, targets, indices):
-        return {
-            'loss_qcmr_quality': self.qcmr_quality_loss_weight
-            * self._qcmr_quality_loss(outputs, targets, indices)
-        }
+        with torch.no_grad():
+            quality_probs = quality_logits.float().sigmoid()
+            stats_zero = quality_probs.sum() * 0.0
+            positive_quality = quality_probs[idx]
+            negative_quality = quality_probs[negative_mask]
+            positive_mean = positive_quality.mean() if positive_quality.numel() else stats_zero
+            negative_mean = negative_quality.mean() if negative_quality.numel() else stats_zero
+
+            correlation = stats_zero
+            if positive_quality.numel() >= 2:
+                matched_iou_float = matched_iou_for_stats.float()
+                quality_centered = positive_quality - positive_quality.mean()
+                iou_centered = matched_iou_float - matched_iou_float.mean()
+                denominator = torch.sqrt(
+                    quality_centered.square().sum() * iou_centered.square().sum())
+                eps = torch.finfo(quality_centered.dtype).eps
+                correlation = torch.where(
+                    denominator > eps,
+                    (quality_centered * iou_centered).sum() / denominator.clamp_min(eps),
+                    stats_zero,
+                )
+
+            self.qcmr_debug_stats = {
+                'qcmr_quality_pos_mean': positive_mean.detach(),
+                'qcmr_quality_neg_mean': negative_mean.detach(),
+                'qcmr_quality_iou_corr': correlation.detach(),
+            }
+        return positive_loss + self.qcmr_quality_neg_weight * negative_loss
 
     def loss_qcmr_quality_enc(self, outputs, targets, indices):
         return {
@@ -326,6 +351,7 @@ class DEIMCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        self.qcmr_debug_stats = {}
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
         # Retrieve the matching between the outputs of the last layer and the targets
@@ -374,11 +400,6 @@ class DEIMCriterion(nn.Module):
             l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in, **meta)
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
-
-        # QCMR quality losses are intentionally outside self.losses so they are
-        # not repeated for decoder auxiliary, pre-head, or denoising outputs.
-        if self.qcmr_enabled and 'pred_quality' in outputs:
-            losses.update(self.loss_qcmr_quality(outputs, targets, indices))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:

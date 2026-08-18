@@ -276,16 +276,13 @@ class LQE(nn.Module):
         init.constant_(self.reg_conf.layers[-1].bias, 0)
         init.constant_(self.reg_conf.layers[-1].weight, 0)
 
-    def forward(self, scores, pred_corners, return_quality=False):
+    def forward(self, scores, pred_corners):
         B, L, _ = pred_corners.size()
         prob = F.softmax(pred_corners.reshape(B, L, 4, self.reg_max+1), dim=-1)
         prob_topk, _ = prob.topk(self.k, dim=-1)
         stat = torch.cat([prob_topk, prob_topk.mean(dim=-1, keepdim=True)], dim=-1)
         quality_score = self.reg_conf(stat.reshape(B, L, -1))
-        adjusted_scores = scores + quality_score
-        if return_quality:
-            return adjusted_scores, quality_score
-        return adjusted_scores
+        return scores + quality_score
 
 
 class TransformerDecoder(nn.Module):
@@ -341,8 +338,7 @@ class TransformerDecoder(nn.Module):
                 reg_scale,
                 attn_mask=None,
                 memory_mask=None,
-                dn_meta=None,
-                return_quality=False):
+                dn_meta=None):
         output = target
         output_detach = pred_corners_undetach = 0
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
@@ -351,7 +347,6 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
-        final_quality = None
         if not hasattr(self, 'project'):
             project = weighting_function(self.reg_max, up, reg_scale)
         else:
@@ -385,10 +380,7 @@ class TransformerDecoder(nn.Module):
             if self.training or i == self.eval_idx:
                 scores = score_head[i](output)
                 # Lqe does not affect the performance here.
-                if return_quality and self.training and i == len(self.layers) - 1:
-                    scores, final_quality = self.lqe_layers[i](scores, pred_corners, return_quality=True)
-                else:
-                    scores = self.lqe_layers[i](scores, pred_corners)
+                scores = self.lqe_layers[i](scores, pred_corners)
                 dec_out_logits.append(scores)
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
@@ -402,7 +394,7 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, final_quality
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
 
 
 @register()
@@ -441,6 +433,7 @@ class DFINETransformer(nn.Module):
                  qcmr_cls_alpha=1.0,
                  qcmr_quality_beta=0.5,
                  qcmr_eps=1e-6,
+                 qcmr_quality_selection_start_epoch=3,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -466,12 +459,16 @@ class DFINETransformer(nn.Module):
         self.qcmr_cls_alpha = qcmr_cls_alpha
         self.qcmr_quality_beta = qcmr_quality_beta
         self.qcmr_eps = qcmr_eps
+        self.qcmr_quality_selection_start_epoch = int(qcmr_quality_selection_start_epoch)
+        self.qcmr_current_epoch = 0
 
         if self.qcmr_enabled:
             if self.qcmr_cls_alpha < 0 or self.qcmr_quality_beta < 0:
                 raise ValueError('QCMR ranking exponents must be non-negative.')
             if self.qcmr_eps <= 0:
                 raise ValueError('qcmr_eps must be positive.')
+            if self.qcmr_quality_selection_start_epoch < 0:
+                raise ValueError('qcmr_quality_selection_start_epoch must be non-negative.')
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -550,6 +547,9 @@ class DFINETransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [self.dec_bbox_head[i] if i <= self.eval_idx else nn.Identity() for i in range(len(self.dec_bbox_head))]
         )
+
+    def set_qcmr_epoch(self, epoch):
+        self.qcmr_current_epoch = int(epoch)
 
     def _reset_parameters(self, feat_channels):
         bias = bias_init_with_prob(0.01)
@@ -713,7 +713,16 @@ class DFINETransformer(nn.Module):
 
     def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor,
                      outputs_anchors_unact: torch.Tensor, topk: int, outputs_quality=None):
-        if self.qcmr_enabled and self.qcmr_use_quality_selection and outputs_quality is not None:
+        quality_selection_active = (
+            self.qcmr_enabled
+            and self.qcmr_use_quality_selection
+            and outputs_quality is not None
+            and (
+                not self.training
+                or self.qcmr_current_epoch >= self.qcmr_quality_selection_start_epoch
+            )
+        )
+        if quality_selection_active:
             if self.query_select_method == 'default':
                 cls_score = outputs_logits.sigmoid().max(-1).values
             elif self.query_select_method == 'one2many':
@@ -787,7 +796,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, dec_quality = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -800,8 +809,7 @@ class DFINETransformer(nn.Module):
             self.up,
             self.reg_scale,
             attn_mask=attn_mask,
-            dn_meta=dn_meta,
-            return_quality=self.qcmr_enabled)
+            dn_meta=dn_meta)
 
         if self.training and dn_meta is not None:
             # the output from the first decoder layer, only one
@@ -813,15 +821,11 @@ class DFINETransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
-            if dec_quality is not None:
-                _, dec_quality = torch.split(dec_quality, dn_meta['dn_num_split'], dim=1)
 
 
         if self.training:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
-            if self.qcmr_enabled and dec_quality is not None:
-                out['pred_quality'] = dec_quality
             if self.qcmr_enabled:
                 out['qcmr_matching'] = True
         else:

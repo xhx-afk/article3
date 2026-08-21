@@ -87,7 +87,7 @@ def test_configs():
 
 def test_model_and_losses(features):
     baseline = _model().train()
-    assert len(baseline.dec_quality_head) == 0
+    assert baseline.dec_quality_head is None
     outputs = baseline(features)
     assert 'pred_quality' not in outputs
 
@@ -99,34 +99,45 @@ def test_model_and_losses(features):
     decoder = _model(qcmr_quality_calibration=True).train()
     dec_outputs = decoder(features)
     assert dec_outputs['pred_quality'].shape == (1, 3, 1)
-    assert dec_outputs['aux_outputs'][0]['pred_quality'].shape == (1, 3, 1)
+    assert all('pred_quality' not in aux for aux in dec_outputs['aux_outputs'])
 
     criterion = DEIMCriterion(matcher=_matcher(), weight_dict={}, losses=[], num_classes=3,
                               reg_max=4, qcmr_quality_calibration=True)
     losses = criterion(dec_outputs, _targets())
     assert 'loss_qcmr_quality_decoder' in losses and torch.isfinite(losses['loss_qcmr_quality_decoder'])
+    assert set(criterion.qcmr_debug_stats) == {
+        'qcmr_decoder_final_quality_pos_mean',
+        'qcmr_decoder_final_quality_neg_mean',
+        'qcmr_decoder_final_quality_iou_corr',
+    }
     assert all(torch.isfinite(v) for v in criterion.qcmr_debug_stats.values())
     losses['loss_qcmr_quality_decoder'].backward()
-    assert any(p.grad is not None for p in decoder.dec_quality_head[-1].parameters())
+    assert any(p.grad is not None for p in decoder.dec_quality_head.parameters())
 
     enc_criterion = DEIMCriterion(matcher=_matcher(), weight_dict={}, losses=[], num_classes=3,
                                   reg_max=4, qcmr_enabled=True)
     enc_losses = enc_criterion(enc_outputs, _targets())
     assert 'loss_qcmr_quality_enc' in enc_losses
-    assert 'qcmr_quality_iou_corr' in enc_criterion.qcmr_debug_stats
+    assert set(enc_criterion.qcmr_debug_stats) == {
+        'qcmr_encoder_quality_pos_mean',
+        'qcmr_encoder_quality_neg_mean',
+        'qcmr_encoder_quality_iou_corr',
+    }
     return baseline, encoder, decoder
 
 
 def test_calibrated_postprocessor():
-    processor = PostProcessor(num_classes=2, num_top_queries=2,
+    processor = PostProcessor(num_classes=2, num_top_queries=1,
                                qcmr_quality_calibration=True,
                                qcmr_score_quality_alpha=1.0,
                                qcmr_score_quality_beta=0.5)
-    outputs = {'pred_logits': torch.tensor([[[4., 0.], [3., 0.]]]),
-               'pred_boxes': torch.tensor([[[.5, .5, .2, .2], [.5, .5, .2, .2]]]),
-               'pred_quality': torch.tensor([[[-4.], [4.]]])}
-    result = processor(outputs, torch.tensor([[32, 32]]))[0]
-    assert result['scores'][0] > result['scores'][1]
+    outputs = {'pred_logits': torch.tensor([[[5., 0.], [4., 0.]]]),
+               'pred_boxes': torch.tensor([[[.2, .5, .2, .2], [.8, .5, .2, .2]]]),
+               'pred_quality': torch.tensor([[[-5.], [5.]]])}
+    baseline = PostProcessor(num_classes=2, num_top_queries=1)(outputs, torch.tensor([[32, 32]]))[0]
+    calibrated = processor(outputs, torch.tensor([[32, 32]]))[0]
+    assert baseline['boxes'][0, 0] < 16
+    assert calibrated['boxes'][0, 0] > 16
 
 
 def main():

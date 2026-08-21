@@ -293,22 +293,10 @@ class DEIMCriterion(nn.Module):
                 f'qcmr_{stats_prefix}quality_iou_corr': correlation.detach(),
             }
             self.qcmr_debug_stats.update(stats)
-            if not stats_prefix:
-                self.qcmr_debug_stats.update({
-                    'qcmr_quality_pos_mean': positive_mean.detach(),
-                    'qcmr_quality_neg_mean': negative_mean.detach(),
-                    'qcmr_quality_iou_corr': correlation.detach(),
-                })
         return positive_loss + self.qcmr_quality_neg_weight * negative_loss
 
     def loss_qcmr_quality_enc(self, outputs, targets, indices):
         loss = self._qcmr_quality_loss(outputs, targets, indices, stats_prefix='encoder_')
-        if 'qcmr_quality_pos_mean' not in self.qcmr_debug_stats:
-            self.qcmr_debug_stats.update({
-                'qcmr_quality_pos_mean': self.qcmr_debug_stats['qcmr_encoder_quality_pos_mean'],
-                'qcmr_quality_neg_mean': self.qcmr_debug_stats['qcmr_encoder_quality_neg_mean'],
-                'qcmr_quality_iou_corr': self.qcmr_debug_stats['qcmr_encoder_quality_iou_corr'],
-            })
         return {
             'loss_qcmr_quality_enc': self.qcmr_encoder_quality_loss_weight
             * loss
@@ -317,7 +305,7 @@ class DEIMCriterion(nn.Module):
     def loss_qcmr_quality_decoder(self, outputs, targets, indices):
         return {
             'loss_qcmr_quality_decoder': self.qcmr_decoder_quality_loss_weight
-            * self._qcmr_quality_loss(outputs, targets, indices)
+            * self._qcmr_quality_loss(outputs, targets, indices, stats_prefix='decoder_final_')
         }
 
     def _get_src_permutation_idx(self, indices):
@@ -446,10 +434,6 @@ class DEIMCriterion(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-
-                if self.qcmr_quality_calibration and 'pred_quality' in aux_outputs:
-                    quality_loss = self.loss_qcmr_quality_decoder(aux_outputs, targets, cached_indices[i])
-                    losses.update({f'{key}_aux_{i}': value for key, value in quality_loss.items()})
 
         # In case of auxiliary traditional head output at first decoder layer. just for dfine
         if 'pre_outputs' in outputs:

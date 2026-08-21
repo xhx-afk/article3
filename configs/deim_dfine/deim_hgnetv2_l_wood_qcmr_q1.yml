@@ -1,4 +1,4 @@
-# Q1: explicit localization-quality supervision only.
+# Q1: encoder localization-quality supervision only.
 __include__:
   - deim_hgnetv2_l_wood.yml
 
@@ -6,20 +6,13 @@ output_dir: ./deim_outputs_origin_small_dataset/deim_hgnetv2_l_wood_qcmr_q1
 
 DFINETransformer:
   qcmr_enabled: true
-  qcmr_use_quality_selection: false
-  qcmr_cls_alpha: 1.0
-  qcmr_quality_beta: 0.5
+  qcmr_quality_calibration: false
   qcmr_eps: 1.0e-6
 
 DEIMCriterion:
   qcmr_enabled: true
-  qcmr_quality_loss_weight: 0.25
+  qcmr_quality_calibration: false
+  qcmr_encoder_quality_loss_weight: 0.5
+  qcmr_decoder_quality_loss_weight: 0.0
   qcmr_quality_neg_weight: 0.25
   qcmr_quality_target_gamma: 1.0
-  matcher:
-    qcmr_quality_matching: false
-    qcmr_match_weight: 0.25
-    qcmr_match_cls_alpha: 1.0
-    qcmr_match_iou_beta: 1.0
-    qcmr_match_pred_quality_beta: 0.0
-    qcmr_eps: 1.0e-6

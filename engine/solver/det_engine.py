@@ -21,21 +21,11 @@ from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
 
-def _set_qcmr_epoch(model, epoch):
-    """Propagate the training epoch without changing the model forward API."""
-    root = model.module if hasattr(model, 'module') else model
-    for module in root.modules():
-        setter = getattr(module, 'set_qcmr_epoch', None)
-        if callable(setter):
-            setter(epoch)
-
-
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
     model.train()
     criterion.train()
-    _set_qcmr_epoch(model, epoch)
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)

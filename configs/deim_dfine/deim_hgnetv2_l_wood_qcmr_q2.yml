@@ -1,26 +1,26 @@
-# Q2: Q1 plus quality-aware encoder Top-K query selection.
+# Q2: decoder quality calibration only.
 __include__:
   - deim_hgnetv2_l_wood.yml
 
 output_dir: ./deim_outputs_origin_small_dataset/deim_hgnetv2_l_wood_qcmr_q2
 
 DFINETransformer:
-  qcmr_enabled: true
-  qcmr_use_quality_selection: true
-  qcmr_cls_alpha: 1.0
-  qcmr_quality_beta: 0.5
+  qcmr_enabled: false
+  qcmr_quality_calibration: true
+  qcmr_score_quality_alpha: 1.0
+  qcmr_score_quality_beta: 0.5
   qcmr_eps: 1.0e-6
-  qcmr_quality_selection_start_epoch: 3
+
+PostProcessor:
+  qcmr_quality_calibration: true
+  qcmr_score_quality_alpha: 1.0
+  qcmr_score_quality_beta: 0.5
+  qcmr_eps: 1.0e-6
 
 DEIMCriterion:
-  qcmr_enabled: true
-  qcmr_quality_loss_weight: 0.25
+  qcmr_enabled: false
+  qcmr_quality_calibration: true
+  qcmr_encoder_quality_loss_weight: 0.0
+  qcmr_decoder_quality_loss_weight: 1.0
   qcmr_quality_neg_weight: 0.25
   qcmr_quality_target_gamma: 1.0
-  matcher:
-    qcmr_quality_matching: false
-    qcmr_match_weight: 0.25
-    qcmr_match_cls_alpha: 1.0
-    qcmr_match_iou_beta: 1.0
-    qcmr_match_pred_quality_beta: 0.0
-    qcmr_eps: 1.0e-6

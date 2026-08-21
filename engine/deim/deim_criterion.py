@@ -40,7 +40,9 @@ class DEIMCriterion(nn.Module):
         mal_alpha=None,
         use_uni_set=True,
         qcmr_enabled=False,
-        qcmr_quality_loss_weight=0.25,
+        qcmr_quality_calibration=False,
+        qcmr_encoder_quality_loss_weight=0.5,
+        qcmr_decoder_quality_loss_weight=1.0,
         qcmr_quality_neg_weight=0.25,
         qcmr_quality_target_gamma=1.0,
         ):
@@ -69,12 +71,15 @@ class DEIMCriterion(nn.Module):
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
         self.qcmr_enabled = qcmr_enabled
-        self.qcmr_quality_loss_weight = qcmr_quality_loss_weight
+        self.qcmr_quality_calibration = qcmr_quality_calibration
+        self.qcmr_encoder_quality_loss_weight = qcmr_encoder_quality_loss_weight
+        self.qcmr_decoder_quality_loss_weight = qcmr_decoder_quality_loss_weight
         self.qcmr_quality_neg_weight = qcmr_quality_neg_weight
         self.qcmr_quality_target_gamma = qcmr_quality_target_gamma
         self.qcmr_debug_stats = {}
-        if self.qcmr_enabled:
-            if self.qcmr_quality_loss_weight < 0 or self.qcmr_quality_neg_weight < 0:
+        if self.qcmr_enabled or self.qcmr_quality_calibration:
+            if self.qcmr_encoder_quality_loss_weight < 0 or self.qcmr_decoder_quality_loss_weight < 0 \
+                    or self.qcmr_quality_neg_weight < 0:
                 raise ValueError('QCMR quality loss weights must be non-negative.')
             if self.qcmr_quality_target_gamma <= 0:
                 raise ValueError('qcmr_quality_target_gamma must be positive.')
@@ -228,7 +233,7 @@ class DEIMCriterion(nn.Module):
 
         return losses
 
-    def _qcmr_quality_loss(self, outputs, targets, indices):
+    def _qcmr_quality_loss(self, outputs, targets, indices, stats_prefix=''):
         """Supervise a class-agnostic quality logit with matched-box IoU."""
         quality_logits = outputs['pred_quality']
         if quality_logits.shape[-1] != 1:
@@ -282,16 +287,36 @@ class DEIMCriterion(nn.Module):
                     stats_zero,
                 )
 
-            self.qcmr_debug_stats = {
-                'qcmr_quality_pos_mean': positive_mean.detach(),
-                'qcmr_quality_neg_mean': negative_mean.detach(),
-                'qcmr_quality_iou_corr': correlation.detach(),
+            stats = {
+                f'qcmr_{stats_prefix}quality_pos_mean': positive_mean.detach(),
+                f'qcmr_{stats_prefix}quality_neg_mean': negative_mean.detach(),
+                f'qcmr_{stats_prefix}quality_iou_corr': correlation.detach(),
             }
+            self.qcmr_debug_stats.update(stats)
+            if not stats_prefix:
+                self.qcmr_debug_stats.update({
+                    'qcmr_quality_pos_mean': positive_mean.detach(),
+                    'qcmr_quality_neg_mean': negative_mean.detach(),
+                    'qcmr_quality_iou_corr': correlation.detach(),
+                })
         return positive_loss + self.qcmr_quality_neg_weight * negative_loss
 
     def loss_qcmr_quality_enc(self, outputs, targets, indices):
+        loss = self._qcmr_quality_loss(outputs, targets, indices, stats_prefix='encoder_')
+        if 'qcmr_quality_pos_mean' not in self.qcmr_debug_stats:
+            self.qcmr_debug_stats.update({
+                'qcmr_quality_pos_mean': self.qcmr_debug_stats['qcmr_encoder_quality_pos_mean'],
+                'qcmr_quality_neg_mean': self.qcmr_debug_stats['qcmr_encoder_quality_neg_mean'],
+                'qcmr_quality_iou_corr': self.qcmr_debug_stats['qcmr_encoder_quality_iou_corr'],
+            })
         return {
-            'loss_qcmr_quality_enc': self.qcmr_quality_loss_weight
+            'loss_qcmr_quality_enc': self.qcmr_encoder_quality_loss_weight
+            * loss
+        }
+
+    def loss_qcmr_quality_decoder(self, outputs, targets, indices):
+        return {
+            'loss_qcmr_quality_decoder': self.qcmr_decoder_quality_loss_weight
             * self._qcmr_quality_loss(outputs, targets, indices)
         }
 
@@ -401,6 +426,10 @@ class DEIMCriterion(nn.Module):
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
 
+        if self.qcmr_quality_calibration and 'pred_quality' in outputs:
+            quality_loss = self.loss_qcmr_quality_decoder(outputs, targets, indices)
+            losses.update(quality_loss)
+
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -417,6 +446,10 @@ class DEIMCriterion(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+
+                if self.qcmr_quality_calibration and 'pred_quality' in aux_outputs:
+                    quality_loss = self.loss_qcmr_quality_decoder(aux_outputs, targets, cached_indices[i])
+                    losses.update({f'{key}_aux_{i}': value for key, value in quality_loss.items()})
 
         # In case of auxiliary traditional head output at first decoder layer. just for dfine
         if 'pre_outputs' in outputs:

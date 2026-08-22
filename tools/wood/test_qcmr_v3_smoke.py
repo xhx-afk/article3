@@ -80,7 +80,7 @@ def _rank_criterion(**overrides):
 
 
 def _rank_outputs(logits, boxes):
-    return {'pred_logits': logits, 'pred_boxes': boxes}
+    return {'pred_logits': logits, 'pred_rank_logits': logits, 'pred_boxes': boxes}
 
 
 def test_configs():
@@ -111,6 +111,59 @@ def test_baseline_and_encoder():
     outputs = encoder(features)
     assert 'pred_quality' not in outputs
     assert outputs['enc_aux_outputs'][0]['pred_quality'].shape == (1, 3, 1)
+    assert 'pred_rank_logits' in outputs
+    torch.testing.assert_close(outputs['pred_rank_logits'], outputs['pred_logits'], rtol=0, atol=1e-6)
+
+
+def test_real_model_gradient_isolation():
+    model = _model().train()
+    features = [torch.randn(1, 8, 4, 4)]
+    outputs = model(features)
+    assert 'pred_rank_logits' in outputs
+    torch.testing.assert_close(outputs['pred_rank_logits'], outputs['pred_logits'], rtol=0, atol=1e-6)
+
+    model.zero_grad(set_to_none=True)
+    outputs['pred_rank_logits'][..., 0].sum().backward()
+
+    score_head = model.dec_score_head[-1]
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+               for p in score_head.parameters())
+    decoder_layer = model.decoder.layers[-1]
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
+               for p in decoder_layer.parameters())
+    assert all(p.grad is None or p.grad.abs().sum() == 0
+               for p in model.decoder.lqe_layers[-1].parameters())
+    assert all(p.grad is None or p.grad.abs().sum() == 0
+               for p in model.dec_bbox_head[-1].parameters())
+
+
+def test_dn_shape_alignment():
+    model = _model(num_denoising=4).train()
+    features = [torch.randn(1, 8, 4, 4)]
+    targets = _targets(torch.tensor([[0.5, 0.5, 0.4, 0.4]]), torch.tensor([0]))
+    outputs = model(features, targets)
+    assert 'dn_outputs' in outputs
+    assert outputs['pred_rank_logits'].shape == outputs['pred_logits'].shape
+
+
+def test_criterion_rank_contract():
+    criterion = _rank_criterion()
+    logits = torch.zeros(1, 1, 3)
+    boxes = torch.tensor([[[0.5, 0.5, 0.8, 0.8]]])
+    try:
+        criterion.loss_qcmr_competitive_rank(
+            {'pred_logits': logits, 'pred_boxes': boxes}, _targets(),
+            [(torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))], epoch=5)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError('QCCR must fail fast when pred_rank_logits is missing.')
+
+    disabled = _rank_criterion(qcmr_local_rank_enabled=False)
+    result = disabled.loss_qcmr_competitive_rank(
+        {'pred_logits': logits, 'pred_boxes': boxes}, _targets(),
+        [(torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))], epoch=5)
+    assert result['loss_qcmr_rank'].item() == 0.0
 
 
 def test_candidate_mining_and_ranking():
@@ -127,6 +180,7 @@ def test_candidate_mining_and_ranking():
     warm = criterion.loss_qcmr_competitive_rank(outputs, targets, indices, epoch=0)
     assert warm['loss_qcmr_rank'].item() == 0.0
     assert criterion.qcmr_debug_stats['qcmr_rank_active'].item() == 0.0
+    assert criterion.qcmr_debug_stats['qcmr_rank_logit_parity_max_abs'].item() == 0.0
 
     losses = criterion.loss_qcmr_competitive_rank(outputs, targets, indices, epoch=5)
     assert losses['loss_qcmr_rank'].item() > 0
@@ -177,6 +231,7 @@ def test_inference_contract():
     with torch.no_grad():
         outputs = model([torch.randn(1, 8, 4, 4)])
     assert 'pred_quality' not in outputs
+    assert 'pred_rank_logits' not in outputs
     postprocessor = PostProcessor(num_classes=3, num_top_queries=3)
     assert not hasattr(postprocessor, 'qcmr_quality_calibration')
     assert not hasattr(postprocessor, 'qcmr_score_quality_alpha')
@@ -189,10 +244,21 @@ def main():
     torch.manual_seed(17)
     test_configs()
     test_baseline_and_encoder()
+    test_real_model_gradient_isolation()
+    test_dn_shape_alignment()
+    test_criterion_rank_contract()
     test_candidate_mining_and_ranking()
     test_exclusions_and_guards()
     test_inference_contract()
-    print('QCMR V3 QCCR smoke tests passed.')
+    print('[PASS] rank logits forward parity')
+    print('[PASS] rank logits available only in training')
+    print('[PASS] DN/non-DN query shape alignment')
+    print('[PASS] QCCR classification score-head gradient')
+    print('[PASS] QCCR shared-decoder gradient')
+    print('[PASS] QCCR no direct LQE/bbox gradient')
+    print('[PASS] candidate mining, exclusions, ownership, and guard')
+    print('[PASS] warm-up and inference contract')
+    print('QCMR V3.1 QCCR smoke tests passed.')
 
 
 if __name__ == '__main__':

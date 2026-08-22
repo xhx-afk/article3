@@ -332,9 +332,17 @@ class DEIMCriterion(nn.Module):
 
     def loss_qcmr_competitive_rank(self, outputs, targets, indices, epoch=0):
         """Rank Hungarian winners above nearby unmatched duplicate queries."""
-        logits = outputs['pred_logits']
+        if not self.qcmr_local_rank_enabled:
+            logits = outputs['pred_logits']
+            return {'loss_qcmr_rank': logits.sum() * 0.0}
+        if 'pred_rank_logits' not in outputs:
+            raise KeyError(
+                'QCCR requires training-only `pred_rank_logits` from DFINETransformer.')
+        logits = outputs['pred_rank_logits']
         zero = logits.sum() * 0.0
         zero_stat = zero.detach()
+        with torch.no_grad():
+            rank_logit_parity = (outputs['pred_rank_logits'] - outputs['pred_logits']).abs().max()
         stats = {
             'qcmr_rank_active': logits.new_tensor(float(
                 self.qcmr_local_rank_enabled and epoch >= self.qcmr_rank_start_epoch)),
@@ -349,9 +357,10 @@ class DEIMCriterion(nn.Module):
             'qcmr_rank_better_unmatched_count': zero_stat,
             'qcmr_rank_better_unmatched_rate': zero_stat,
             'qcmr_rank_matched_winner_rate': zero_stat,
+            'qcmr_rank_logit_parity_max_abs': rank_logit_parity.detach(),
         }
         self.qcmr_debug_stats.update(stats)
-        if not self.qcmr_local_rank_enabled or epoch < self.qcmr_rank_start_epoch:
+        if epoch < self.qcmr_rank_start_epoch:
             return {'loss_qcmr_rank': zero}
 
         pair_losses, pair_weights = [], []

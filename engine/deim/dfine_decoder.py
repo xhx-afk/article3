@@ -345,6 +345,7 @@ class TransformerDecoder(nn.Module):
 
         dec_out_bboxes = []
         dec_out_logits = []
+        dec_out_rank_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
         if not hasattr(self, 'project'):
@@ -378,10 +379,15 @@ class TransformerDecoder(nn.Module):
             inter_ref_bbox = distance2bbox(ref_points_initial, integral(pred_corners, project), reg_scale)
 
             if self.training or i == self.eval_idx:
-                scores = score_head[i](output)
+                raw_scores = score_head[i](output)
                 # Lqe does not affect the performance here.
-                scores = self.lqe_layers[i](scores, pred_corners)
+                scores = self.lqe_layers[i](raw_scores, pred_corners)
                 dec_out_logits.append(scores)
+                if self.training:
+                    # Match inference values while isolating QCCR from the
+                    # localization-specific LQE/FDR branch during backward.
+                    rank_scores = raw_scores + (scores - raw_scores).detach()
+                    dec_out_rank_logits.append(rank_scores)
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
@@ -393,8 +399,9 @@ class TransformerDecoder(nn.Module):
             ref_points_detach = inter_ref_bbox.detach()
             output_detach = output.detach()
 
+        rank_logits = torch.stack(dec_out_rank_logits) if self.training else None
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, rank_logits
 
 
 @register()
@@ -748,7 +755,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, out_rank_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -769,12 +776,14 @@ class DFINETransformer(nn.Module):
             dn_pre_bboxes, pre_bboxes = torch.split(pre_bboxes, dn_meta['dn_num_split'], dim=1)
 
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
+            dn_out_rank_logits, out_rank_logits = torch.split(out_rank_logits, dn_meta['dn_num_split'], dim=2)
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
         if self.training:
-            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
+            out = {'pred_logits': out_logits[-1], 'pred_rank_logits': out_rank_logits[-1],
+                   'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}

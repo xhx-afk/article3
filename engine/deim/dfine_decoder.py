@@ -347,7 +347,6 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
-        dec_out_hidden = []
         if not hasattr(self, 'project'):
             project = weighting_function(self.reg_max, up, reg_scale)
         else:
@@ -386,7 +385,6 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
-                dec_out_hidden.append(output)
 
                 if not self.training:
                     break
@@ -396,8 +394,7 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), \
-               dec_out_hidden, pre_bboxes, pre_scores
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
 
 
 @register()
@@ -431,11 +428,7 @@ class DFINETransformer(nn.Module):
                  reg_scale=4.,
                  layer_scale=1,
                  mlp_act='relu',
-                 qcmr_enabled=False,
-                 qcmr_quality_calibration=False,
-                 qcmr_score_quality_alpha=1.0,
-                 qcmr_score_quality_beta=0.5,
-                 qcmr_eps=1e-6,
+                 qcmr_encoder_quality_enabled=False,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -456,17 +449,7 @@ class DFINETransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
-        self.qcmr_enabled = qcmr_enabled
-        self.qcmr_quality_calibration = qcmr_quality_calibration
-        self.qcmr_score_quality_alpha = qcmr_score_quality_alpha
-        self.qcmr_score_quality_beta = qcmr_score_quality_beta
-        self.qcmr_eps = qcmr_eps
-
-        if self.qcmr_enabled or self.qcmr_quality_calibration:
-            if self.qcmr_score_quality_alpha < 0 or self.qcmr_score_quality_beta < 0:
-                raise ValueError('Quality calibration exponents must be non-negative.')
-            if self.qcmr_eps <= 0:
-                raise ValueError('qcmr_eps must be positive.')
+        self.qcmr_encoder_quality_enabled = qcmr_encoder_quality_enabled
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -514,7 +497,7 @@ class DFINETransformer(nn.Module):
             self.enc_score_head = nn.Linear(hidden_dim, num_classes)
 
         self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
-        if self.qcmr_enabled:
+        if self.qcmr_encoder_quality_enabled:
             self.enc_quality_head = MLP(hidden_dim, hidden_dim, 1, 2, act=mlp_act)
 
         # decoder head
@@ -526,9 +509,6 @@ class DFINETransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
-        self.dec_quality_head = None
-        if self.qcmr_quality_calibration:
-            self.dec_quality_head = MLP(hidden_dim, hidden_dim, 1, 2, act='gelu')
         self.integral = Integral(self.reg_max)
 
         # init encoder output anchors and valid_mask
@@ -554,7 +534,7 @@ class DFINETransformer(nn.Module):
         init.constant_(self.enc_score_head.bias, bias)
         init.constant_(self.enc_bbox_head.layers[-1].weight, 0)
         init.constant_(self.enc_bbox_head.layers[-1].bias, 0)
-        if self.qcmr_enabled:
+        if self.qcmr_encoder_quality_enabled:
             # Keep the initial quality prior constant so Q2 starts with baseline ranking.
             init.constant_(self.enc_quality_head.layers[-1].weight, 0)
             init.constant_(self.enc_quality_head.layers[-1].bias, 0)
@@ -567,9 +547,6 @@ class DFINETransformer(nn.Module):
             if hasattr(reg_, 'layers'):
                 init.constant_(reg_.layers[-1].weight, 0)
                 init.constant_(reg_.layers[-1].bias, 0)
-        if self.dec_quality_head is not None:
-            init.constant_(self.dec_quality_head.layers[-1].weight, 0)
-            init.constant_(self.dec_quality_head.layers[-1].bias, 0)
 
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -681,7 +658,7 @@ class DFINETransformer(nn.Module):
 
         output_memory :torch.Tensor = self.enc_output(memory)
         enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory)
-        enc_outputs_quality = self.enc_quality_head(output_memory) if self.qcmr_enabled else None
+        enc_outputs_quality = self.enc_quality_head(output_memory) if self.qcmr_encoder_quality_enabled else None
 
         enc_topk_bboxes_list, enc_topk_logits_list, enc_topk_quality_list = [], [], []
         enc_topk_memory, enc_topk_logits, enc_topk_anchors, enc_topk_quality = \
@@ -771,7 +748,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, out_hidden, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -796,29 +773,11 @@ class DFINETransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
-            dn_out_hidden = []
-            query_out_hidden = []
-            split_size = dn_meta['dn_num_split']
-            for hidden in out_hidden:
-                dn_hidden, hidden = torch.split(hidden, split_size, dim=1)
-                dn_out_hidden.append(dn_hidden)
-                query_out_hidden.append(hidden)
-            out_hidden = query_out_hidden
-
-        out_quality = None
-        if self.qcmr_quality_calibration:
-            out_quality = self.dec_quality_head(out_hidden[-1])
-
-
         if self.training:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
-            if out_quality is not None:
-                out['pred_quality'] = out_quality
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
-            if out_quality is not None:
-                out['pred_quality'] = out_quality
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],

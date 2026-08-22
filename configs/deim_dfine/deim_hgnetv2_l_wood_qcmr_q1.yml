@@ -5,14 +5,10 @@ __include__:
 output_dir: ./deim_outputs_origin_small_dataset/deim_hgnetv2_l_wood_qcmr_q1
 
 DFINETransformer:
-  qcmr_enabled: true
-  qcmr_quality_calibration: false
-  qcmr_eps: 1.0e-6
+  qcmr_encoder_quality_enabled: true
 
 DEIMCriterion:
-  qcmr_enabled: true
-  qcmr_quality_calibration: false
+  qcmr_encoder_quality_enabled: true
   qcmr_encoder_quality_loss_weight: 0.5
-  qcmr_decoder_quality_loss_weight: 0.0
-  qcmr_quality_neg_weight: 0.25
-  qcmr_quality_target_gamma: 1.0
+  qcmr_encoder_quality_neg_weight: 0.25
+  qcmr_encoder_quality_target_gamma: 1.0

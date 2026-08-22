@@ -1,0 +1,21 @@
+# QCCR R1: baseline DEIM plus local competitive ranking.
+__include__:
+  - deim_hgnetv2_l_wood.yml
+
+output_dir: ./deim_outputs_origin_small_dataset/deim_hgnetv2_l_wood_qcmr_v3_r1
+
+DFINETransformer:
+  qcmr_encoder_quality_enabled: false
+
+DEIMCriterion:
+  qcmr_encoder_quality_enabled: false
+  qcmr_local_rank_enabled: true
+  qcmr_rank_loss_weight: 0.05
+  qcmr_rank_start_epoch: 5
+  qcmr_rank_min_pos_iou: 0.50
+  qcmr_rank_min_comp_iou: 0.50
+  qcmr_rank_topk_competitors: 3
+  qcmr_rank_better_comp_tolerance: 0.05
+  qcmr_rank_temperature: 0.20
+  qcmr_rank_pos_quality_power: 1.0
+  qcmr_rank_comp_quality_power: 1.0

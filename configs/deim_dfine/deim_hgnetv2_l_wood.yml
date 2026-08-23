@@ -143,9 +143,12 @@ optimizer:
 # Localization Residual Refinement Module (LRRM).
 DFINETransformer:
   lrrm_enabled: true
-  lrrm_delta_scale: 0.1
+  lrrm_delta_scale: 0.05
 
 DEIMCriterion:
+  weight_dict:
+    loss_ref_l1: 1.0
+    loss_ref_giou: 1.0
   lrrm_enabled: true
   lrrm_loss_weight: 1.0
   lrrm_start_epoch: 10

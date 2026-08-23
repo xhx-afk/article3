@@ -233,8 +233,8 @@ class DEIMCriterion(nn.Module):
         """Refine matched boxes without changing the original DEIM target path."""
         if not self.lrrm_enabled:
             return {}
-        if 'pred_refined_boxes' not in outputs:
-            raise KeyError('LRRM requires `pred_refined_boxes` from DFINETransformer.')
+        assert 'pred_refined_boxes' in outputs, \
+            'LRRM requires `pred_refined_boxes` from DFINETransformer.'
 
         refined_boxes = outputs['pred_refined_boxes']
         delta_boxes = outputs.get('pred_delta_boxes')
@@ -273,8 +273,8 @@ class DEIMCriterion(nn.Module):
         loss_ref_giou = 1 - torch.diag(generalized_box_iou(
             box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
         loss_ref_giou = loss_ref_giou.sum() / max(float(num_boxes), 1.0)
-        weighted_l1 = self.lrrm_loss_weight * loss_ref_l1
-        weighted_giou = self.lrrm_loss_weight * loss_ref_giou
+        weighted_l1 = self.lrrm_loss_weight * self.weight_dict.get('loss_ref_l1', 1.0) * loss_ref_l1
+        weighted_giou = self.lrrm_loss_weight * self.weight_dict.get('loss_ref_giou', 1.0) * loss_ref_giou
         self.lrrm_debug_stats.update({
             'train_loss_ref_l1': weighted_l1.detach(),
             'train_loss_ref_giou': weighted_giou.detach(),

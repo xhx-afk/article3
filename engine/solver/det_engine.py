@@ -151,12 +151,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
-        # Keep PostProcessor baseline-compatible while evaluating refined boxes.
-        postprocess_outputs = outputs
-        if 'pred_refined_boxes' in outputs:
-            postprocess_outputs = dict(outputs)
-            postprocess_outputs['pred_boxes'] = outputs['pred_refined_boxes']
-        results = postprocessor(postprocess_outputs, orig_target_sizes)
+        results = postprocessor(outputs, orig_target_sizes)
 
         # if 'segm' in postprocessor.keys():
         #     target_sizes = torch.stack([t["size"] for t in targets], dim=0)

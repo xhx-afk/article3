@@ -48,7 +48,8 @@ class PostProcessor(nn.Module):
 
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor):
-        logits, boxes = outputs['pred_logits'], outputs['pred_boxes']
+        logits = outputs['pred_logits']
+        boxes = outputs.get('pred_refined_boxes', outputs['pred_boxes'])
         # orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
         bbox_pred = torchvision.ops.box_convert(boxes, in_fmt='cxcywh', out_fmt='xyxy')

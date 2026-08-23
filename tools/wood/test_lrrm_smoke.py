@@ -31,6 +31,7 @@ _install_isolated_engine_packages()
 from engine.deim.deim_criterion import DEIMCriterion
 from engine.deim.dfine_decoder import DFINETransformer
 from engine.deim.matcher import HungarianMatcher
+from engine.deim.postprocessor import PostProcessor
 
 
 def _model(**overrides):
@@ -66,7 +67,7 @@ def test_forward_and_zero_init():
 
     baseline = _model(lrrm_enabled=False).eval()
     baseline_outputs = baseline([torch.randn(1, 8, 4, 4)])
-    assert not hasattr(baseline, 'dec_lrrm_head') or baseline.dec_lrrm_head is None
+    assert baseline.lrrm_head is None
     torch.testing.assert_close(baseline_outputs['pred_refined_boxes'], baseline_outputs['pred_boxes'])
 
 
@@ -90,7 +91,7 @@ def test_refinement_loss_and_warmup():
     model.zero_grad(set_to_none=True)
     sum(losses.values()).backward()
     assert any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().sum() > 0
-               for p in model.dec_lrrm_head[-1].parameters())
+               for p in model.lrrm_head.parameters())
     assert criterion.lrrm_debug_stats['max_delta_box'].item() == 0.0
 
     integration_model = _model().train()
@@ -98,6 +99,8 @@ def test_refinement_loss_and_warmup():
     integration_outputs = integration_model([torch.randn(1, 8, 4, 4)], integration_targets)
     integration_losses = criterion(integration_outputs, integration_targets, epoch=10)
     assert 'loss_ref_l1' in integration_losses and 'loss_ref_giou' in integration_losses
+    assert all({'pred_refined_boxes', 'pred_delta_boxes'} <= aux.keys()
+               for aux in integration_outputs['aux_outputs'])
 
 
 def test_dn_and_eval_contract():
@@ -113,13 +116,29 @@ def test_dn_and_eval_contract():
     assert 'pred_refined_boxes' in eval_outputs
     assert eval_outputs['pred_refined_boxes'].shape == eval_outputs['pred_boxes'].shape
 
+    scaled_model = _model(layer_scale=2, eval_idx=0).train()
+    scaled_outputs = scaled_model([torch.randn(1, 8, 4, 4)])
+    assert scaled_outputs['pred_refined_boxes'].shape == scaled_outputs['pred_boxes'].shape
+
+
+def test_postprocessor_prefers_refined_boxes():
+    postprocessor = PostProcessor(num_classes=1, num_top_queries=1)
+    outputs = {
+        'pred_logits': torch.tensor([[[8.0]]]),
+        'pred_boxes': torch.tensor([[[0.2, 0.2, 0.1, 0.1]]]),
+        'pred_refined_boxes': torch.tensor([[[0.8, 0.8, 0.1, 0.1]]]),
+    }
+    result = postprocessor(outputs, torch.tensor([[100, 100]]))[0]
+    torch.testing.assert_close(result['boxes'][0, :2], torch.tensor([75.0, 75.0]))
+
 
 def main():
     torch.manual_seed(23)
     test_forward_and_zero_init()
     test_refinement_loss_and_warmup()
     test_dn_and_eval_contract()
-    print('LRRM V1 smoke tests passed.')
+    test_postprocessor_prefers_refined_boxes()
+    print('LRRM V1.1 smoke tests passed.')
 
 
 if __name__ == '__main__':

@@ -354,7 +354,6 @@ class TransformerDecoder(nn.Module):
                 integral,
                 up,
                 reg_scale,
-                lrrm_heads=None,
                 attn_mask=None,
                 memory_mask=None,
                 dn_meta=None):
@@ -363,8 +362,6 @@ class TransformerDecoder(nn.Module):
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
 
         dec_out_bboxes = []
-        dec_out_refined_bboxes = []
-        dec_out_deltas = []
         dec_out_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
@@ -404,12 +401,6 @@ class TransformerDecoder(nn.Module):
                 scores = self.lqe_layers[i](scores, pred_corners)
                 dec_out_logits.append(scores)
                 dec_out_bboxes.append(inter_ref_bbox)
-                if lrrm_heads is None:
-                    delta_box = inter_ref_bbox.new_zeros(inter_ref_bbox.shape)
-                else:
-                    delta_box = lrrm_heads[i](output)
-                dec_out_deltas.append(delta_box)
-                dec_out_refined_bboxes.append(inter_ref_bbox + delta_box)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
 
@@ -422,7 +413,7 @@ class TransformerDecoder(nn.Module):
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
                torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), \
-               torch.stack(dec_out_refined_bboxes), torch.stack(dec_out_deltas), pre_bboxes, pre_scores
+               pre_bboxes, pre_scores, output
 
 
 @register()
@@ -457,7 +448,7 @@ class DFINETransformer(nn.Module):
                  layer_scale=1,
                  mlp_act='relu',
                  lrrm_enabled=False,
-                 lrrm_delta_scale=0.1,
+                 lrrm_delta_scale=0.05,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -539,13 +530,11 @@ class DFINETransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
-        self.dec_lrrm_head = None
+        self.lrrm_head = None
         if self.lrrm_enabled:
-            self.dec_lrrm_head = nn.ModuleList(
-                [LocalizationResidualHead(hidden_dim, hidden_dim, self.lrrm_delta_scale)
-                 for _ in range(self.eval_idx + 1)]
-              + [LocalizationResidualHead(scaled_dim, scaled_dim, self.lrrm_delta_scale)
-                 for _ in range(num_layers - self.eval_idx - 1)])
+            final_feature_dim = hidden_dim if self.eval_idx == num_layers - 1 else scaled_dim
+            self.lrrm_head = LocalizationResidualHead(
+                final_feature_dim, final_feature_dim, self.lrrm_delta_scale)
         self.integral = Integral(self.reg_max)
 
         # init encoder output anchors and valid_mask
@@ -765,7 +754,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, out_refined_bboxes, out_deltas, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, final_feature = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -777,7 +766,6 @@ class DFINETransformer(nn.Module):
             self.integral,
             self.up,
             self.reg_scale,
-            self.dec_lrrm_head if self.lrrm_enabled else None,
             attn_mask=attn_mask,
             dn_meta=dn_meta)
 
@@ -788,21 +776,26 @@ class DFINETransformer(nn.Module):
 
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
-            dn_out_refined_bboxes, out_refined_bboxes = torch.split(out_refined_bboxes, dn_meta['dn_num_split'], dim=2)
-            dn_out_deltas, out_deltas = torch.split(out_deltas, dn_meta['dn_num_split'], dim=2)
+            _, final_feature = torch.split(final_feature, dn_meta['dn_num_split'], dim=1)
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
-
-
+        pred_boxes = out_bboxes[-1]
+        if self.lrrm_enabled:
+            pred_delta_boxes = self.lrrm_head(final_feature)
+            pred_refined_boxes = torch.sigmoid(
+                inverse_sigmoid(pred_boxes) + pred_delta_boxes)
+        else:
+            pred_delta_boxes = torch.zeros_like(pred_boxes)
+            pred_refined_boxes = pred_boxes
         if self.training:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],
-                   'pred_refined_boxes': out_refined_bboxes[-1], 'pred_delta_boxes': out_deltas[-1],
+                   'pred_refined_boxes': pred_refined_boxes, 'pred_delta_boxes': pred_delta_boxes,
                    'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],
-                   'pred_refined_boxes': out_refined_bboxes[-1], 'pred_delta_boxes': out_deltas[-1]}
+                   'pred_refined_boxes': pred_refined_boxes, 'pred_delta_boxes': pred_delta_boxes}
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
@@ -834,6 +827,8 @@ class DFINETransformer(nn.Module):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
-                     'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
+        return [{'pred_logits': a, 'pred_boxes': b,
+                 'pred_refined_boxes': b, 'pred_delta_boxes': torch.zeros_like(b),
+                 'pred_corners': c, 'ref_points': d,
+                 'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
                 for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)]

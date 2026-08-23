@@ -18,6 +18,7 @@ import torch.nn.init as init
 from typing import List
 
 from .dfine_utils import weighting_function, distance2bbox
+from .dn_components import prepare_for_dn, dn_post_process
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
@@ -38,24 +39,6 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = self.act(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
-
-
-class LocalizationResidualHead(nn.Module):
-    """Predict a bounded normalized-box residual from decoder features."""
-
-    def __init__(self, input_dim, hidden_dim, delta_scale=0.1):
-        super().__init__()
-        self.delta_scale = float(delta_scale)
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 4),
-        )
-        nn.init.zeros_(self.layers[-1].weight)
-        nn.init.zeros_(self.layers[-1].bias)
-
-    def forward(self, features):
-        return self.delta_scale * torch.tanh(self.layers(features))
 
 
 class MSDeformableAttention(nn.Module):
@@ -412,8 +395,7 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
 
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), \
-               pre_bboxes, pre_scores, output
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
 
 
 @register()
@@ -436,6 +418,7 @@ class DFINETransformer(nn.Module):
                  num_denoising=100,
                  label_noise_ratio=0.5,
                  box_noise_scale=1.0,
+                 dn_query=None,
                  learn_query_content=False,
                  eval_spatial_size=None,
                  eval_idx=-1,
@@ -447,8 +430,6 @@ class DFINETransformer(nn.Module):
                  reg_scale=4.,
                  layer_scale=1,
                  mlp_act='relu',
-                 lrrm_enabled=False,
-                 lrrm_delta_scale=0.05,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -469,10 +450,6 @@ class DFINETransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
-        self.lrrm_enabled = bool(lrrm_enabled)
-        self.lrrm_delta_scale = float(lrrm_delta_scale)
-        if self.lrrm_delta_scale <= 0:
-            raise ValueError('lrrm_delta_scale must be positive.')
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -492,10 +469,12 @@ class DFINETransformer(nn.Module):
         self.decoder = TransformerDecoder(hidden_dim, decoder_layer, decoder_layer_wide, num_layers, nhead,
                                           reg_max, self.reg_scale, self.up, eval_idx, layer_scale, act=activation)
       # denoising
-        self.num_denoising = num_denoising
-        self.label_noise_ratio = label_noise_ratio
-        self.box_noise_scale = box_noise_scale
-        if num_denoising > 0:
+        dn_query = dn_query or {}
+        self.dn_enabled = bool(dn_query.get('enabled', False))
+        self.num_denoising = int(dn_query.get('dn_number', num_denoising))
+        self.label_noise_ratio = float(dn_query.get('label_noise_ratio', label_noise_ratio))
+        self.box_noise_scale = float(dn_query.get('box_noise_scale', box_noise_scale))
+        if self.num_denoising > 0:
             self.denoising_class_embed = nn.Embedding(num_classes+1, hidden_dim, padding_idx=num_classes)
             init.normal_(self.denoising_class_embed.weight[:-1])
 
@@ -530,11 +509,6 @@ class DFINETransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
-        self.lrrm_head = None
-        if self.lrrm_enabled:
-            final_feature_dim = hidden_dim if self.eval_idx == num_layers - 1 else scaled_dim
-            self.lrrm_head = LocalizationResidualHead(
-                final_feature_dim, final_feature_dim, self.lrrm_delta_scale)
         self.integral = Integral(self.reg_max)
 
         # init encoder output anchors and valid_mask
@@ -738,15 +712,21 @@ class DFINETransformer(nn.Module):
 
         # prepare denoising training
         if self.training and self.num_denoising > 0:
-            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
-                get_contrastive_denoising_training_group(targets, \
-                    self.num_classes,
-                    self.num_queries,
-                    self.denoising_class_embed,
-                    num_denoising=self.num_denoising,
+            if self.dn_enabled:
+                denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = prepare_for_dn(
+                    targets, self.denoising_class_embed, len(targets), self.training,
+                    self.num_queries, self.num_classes, self.hidden_dim,
+                    dn_number=self.num_denoising,
                     label_noise_ratio=self.label_noise_ratio,
-                    box_noise_scale=1.0,
-                    )
+                    box_noise_scale=self.box_noise_scale)
+            else:
+                denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
+                    get_contrastive_denoising_training_group(
+                        targets, self.num_classes, self.num_queries,
+                        self.denoising_class_embed,
+                        num_denoising=self.num_denoising,
+                        label_noise_ratio=self.label_noise_ratio,
+                        box_noise_scale=self.box_noise_scale)
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
@@ -754,7 +734,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, final_feature = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -774,28 +754,18 @@ class DFINETransformer(nn.Module):
             dn_pre_logits, pre_logits = torch.split(pre_logits, dn_meta['dn_num_split'], dim=1)
             dn_pre_bboxes, pre_bboxes = torch.split(pre_bboxes, dn_meta['dn_num_split'], dim=1)
 
-            dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
-            dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
-            _, final_feature = torch.split(final_feature, dn_meta['dn_num_split'], dim=1)
+            dn_out_logits, out_logits, dn_out_bboxes, out_bboxes = dn_post_process(
+                out_logits, out_bboxes, dn_meta)
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
-        pred_boxes = out_bboxes[-1]
-        if self.lrrm_enabled:
-            pred_delta_boxes = self.lrrm_head(final_feature)
-            pred_refined_boxes = torch.sigmoid(
-                inverse_sigmoid(pred_boxes) + pred_delta_boxes)
-        else:
-            pred_delta_boxes = torch.zeros_like(pred_boxes)
-            pred_refined_boxes = pred_boxes
+
+
         if self.training:
-            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],
-                   'pred_refined_boxes': pred_refined_boxes, 'pred_delta_boxes': pred_delta_boxes,
-                   'pred_corners': out_corners[-1],
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
-            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],
-                   'pred_refined_boxes': pred_refined_boxes, 'pred_delta_boxes': pred_delta_boxes}
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
@@ -827,8 +797,6 @@ class DFINETransformer(nn.Module):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b,
-                 'pred_refined_boxes': b, 'pred_delta_boxes': torch.zeros_like(b),
-                 'pred_corners': c, 'ref_points': d,
-                 'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
+        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
+                     'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
                 for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)]

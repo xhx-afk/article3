@@ -51,12 +51,12 @@ mosaic_output_size: &mosaic_output_size 480
 multiscale_repeat: &multiscale_repeat 4
 
 # 全局 batch size；多卡训练时单卡 batch_size = total_batch_size / GPU 数量。
-train_total_batch_size: &train_total_batch_size 8
-val_total_batch_size: &val_total_batch_size 8
+train_total_batch_size: &train_total_batch_size 16
+val_total_batch_size: &val_total_batch_size 16
 
-# Wood 数据路径，按实际机器位置修改。/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_quick_balanced_4000/images/test
-train_img_folder: &train_img_folder /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_fiter50_final_best/images/train
-train_ann_file: &train_ann_file /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_fiter50_final_best/annotations/instances_train.json
+# Wood 数据路径，按实际机器位置修改。/home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_fiter50_final_best/images/train
+train_img_folder: &train_img_folder /home/zxw4090/hjw/D-FINE/data/WoodDefect/small_train/images/train
+train_ann_file: &train_ann_file /home/zxw4090/hjw/D-FINE/data/WoodDefect/small_train/annotations/instances_train.json
 val_img_folder: &val_img_folder /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_fiter50_final_best/images/val
 val_ann_file: &val_ann_file /home/zxw4090/hjw/D-FINE/data/WoodDefect/wood_coco_all_only_defect_fiter50_final_best/annotations/instances_val.json
 # ========================================================
@@ -140,15 +140,16 @@ optimizer:
   betas: [0.9, 0.999]
   weight_decay: 0.000125
 
-# Localization Residual Refinement Module (LRRM).
+# DINO/DN-DETR style query denoising (training only).
+dn_query: &dn_query
+  enabled: true
+  dn_number: 50
+  label_noise_ratio: 0.5
+  box_noise_scale: 0.2
+  dn_loss_weight: 1.0
+
 DFINETransformer:
-  lrrm_enabled: true
-  lrrm_delta_scale: 0.05
+  dn_query: *dn_query
 
 DEIMCriterion:
-  weight_dict:
-    loss_ref_l1: 1.0
-    loss_ref_giou: 1.0
-  lrrm_enabled: true
-  lrrm_loss_weight: 1.0
-  lrrm_start_epoch: 10
+  dn_query: *dn_query

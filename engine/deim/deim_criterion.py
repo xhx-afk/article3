@@ -15,6 +15,7 @@ import torchvision
 import copy
 
 from .dfine_utils import bbox2distance
+from .dn_components import compute_dn_loss
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 from ..misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ..core import register
@@ -39,9 +40,7 @@ class DEIMCriterion(nn.Module):
         share_matched_indices=False,
         mal_alpha=None,
         use_uni_set=True,
-        lrrm_enabled=False,
-        lrrm_loss_weight=1.0,
-        lrrm_start_epoch=10,
+        dn_query=None,
         ):
         """Create the criterion.
         Parameters:
@@ -67,12 +66,17 @@ class DEIMCriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
-        self.lrrm_enabled = bool(lrrm_enabled)
-        self.lrrm_loss_weight = float(lrrm_loss_weight)
-        self.lrrm_start_epoch = int(lrrm_start_epoch)
-        self.lrrm_debug_stats = {}
-        if self.lrrm_loss_weight < 0 or self.lrrm_start_epoch < 0:
-            raise ValueError('LRRM loss weight and start epoch must be non-negative.')
+        dn_query = dn_query or {}
+        self.dn_enabled = bool(dn_query.get('enabled', False))
+        self.dn_loss_weight = float(dn_query.get('dn_loss_weight', 1.0))
+        if self.dn_loss_weight < 0:
+            raise ValueError('dn_loss_weight must be non-negative.')
+
+    def loss_dn_queries(self, outputs, targets, dn_meta, num_boxes):
+        """Compute explicit DN reconstruction losses on known positive queries."""
+        return compute_dn_loss(
+            outputs, targets, dn_meta, self.num_classes, num_boxes,
+            alpha=self.alpha, gamma=self.gamma, loss_weight=self.dn_loss_weight)
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -229,58 +233,6 @@ class DEIMCriterion(nn.Module):
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
-    def loss_localization_refinement(self, outputs, targets, indices, epoch=0, num_boxes=None):
-        """Refine matched boxes without changing the original DEIM target path."""
-        if not self.lrrm_enabled:
-            return {}
-        assert 'pred_refined_boxes' in outputs, \
-            'LRRM requires `pred_refined_boxes` from DFINETransformer.'
-
-        refined_boxes = outputs['pred_refined_boxes']
-        delta_boxes = outputs.get('pred_delta_boxes')
-        zero = refined_boxes.sum() * 0.0
-        if delta_boxes is None:
-            delta_boxes = refined_boxes - outputs['pred_boxes']
-        with torch.no_grad():
-            self.lrrm_debug_stats = {
-                'mean_delta_box': delta_boxes.detach().abs().mean(),
-                'max_delta_box': delta_boxes.detach().abs().max(),
-            }
-
-        if epoch < self.lrrm_start_epoch:
-            self.lrrm_debug_stats.update({
-                'train_loss_ref_l1': zero.detach(),
-                'train_loss_ref_giou': zero.detach(),
-            })
-            return {'loss_ref_l1': zero, 'loss_ref_giou': zero}
-
-        idx = self._get_src_permutation_idx(indices)
-        if idx[0].numel() == 0:
-            self.lrrm_debug_stats.update({
-                'train_loss_ref_l1': zero.detach(),
-                'train_loss_ref_giou': zero.detach(),
-            })
-            return {'loss_ref_l1': zero, 'loss_ref_giou': zero}
-
-        if num_boxes is None:
-            num_boxes = max(sum(len(target['labels']) for target in targets), 1)
-        src_boxes = refined_boxes[idx]
-        target_boxes = torch.cat(
-            [target['boxes'][target_idx] for target, (_, target_idx) in zip(targets, indices)],
-            dim=0,
-        )
-        loss_ref_l1 = F.smooth_l1_loss(src_boxes, target_boxes, reduction='sum') / max(float(num_boxes), 1.0)
-        loss_ref_giou = 1 - torch.diag(generalized_box_iou(
-            box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
-        loss_ref_giou = loss_ref_giou.sum() / max(float(num_boxes), 1.0)
-        weighted_l1 = self.lrrm_loss_weight * self.weight_dict.get('loss_ref_l1', 1.0) * loss_ref_l1
-        weighted_giou = self.lrrm_loss_weight * self.weight_dict.get('loss_ref_giou', 1.0) * loss_ref_giou
-        self.lrrm_debug_stats.update({
-            'train_loss_ref_l1': weighted_l1.detach(),
-            'train_loss_ref_giou': weighted_giou.detach(),
-        })
-        return {'loss_ref_l1': weighted_l1, 'loss_ref_giou': weighted_giou}
-
     def _get_tgt_permutation_idx(self, indices):
         # permute targets following indices
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
@@ -331,7 +283,6 @@ class DEIMCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
-        self.lrrm_debug_stats = {}
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
         # Retrieve the matching between the outputs of the last layer and the targets
@@ -380,10 +331,6 @@ class DEIMCriterion(nn.Module):
             l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in, **meta)
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
-
-        if self.lrrm_enabled:
-            losses.update(self.loss_localization_refinement(
-                outputs, targets, indices, epoch=kwargs.get('epoch', 0), num_boxes=num_boxes))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -445,17 +392,36 @@ class DEIMCriterion(nn.Module):
             if class_agnostic:
                 self.num_classes = orig_num_classes
 
-        # In case of cdn auxiliary losses.
+        # In case of DN decoder losses.
         if 'dn_outputs' in outputs:
             assert 'dn_meta' in outputs, ''
-            indices_dn = self.get_cdn_matched_indices(outputs['dn_meta'], targets)
-            dn_num_boxes = num_boxes * outputs['dn_meta']['dn_num_group']
+            dn_meta = outputs['dn_meta']
+            indices_dn = self.get_dn_matched_indices(dn_meta, targets)
+            dn_num_boxes = sum(len(target['labels']) for target in targets)
+            dn_num_boxes *= dn_meta['dn_num_group']
+            dn_num_boxes = torch.as_tensor(
+                [dn_num_boxes], dtype=torch.float,
+                device=outputs['dn_outputs'][0]['pred_logits'].device)
+            if is_dist_available_and_initialized():
+                torch.distributed.all_reduce(dn_num_boxes)
+            dn_num_boxes = torch.clamp(
+                dn_num_boxes / get_world_size(), min=1).item()
 
             for i, aux_outputs in enumerate(outputs['dn_outputs']):
+                if self.dn_enabled:
+                    dn_losses = self.loss_dn_queries(
+                        aux_outputs, targets, dn_meta, dn_num_boxes)
+                    if i == len(outputs['dn_outputs']) - 1:
+                        losses.update(dn_losses)
+                    else:
+                        losses.update({f'{key}_aux_{i}': value for key, value in dn_losses.items()})
+
                 if 'local' in self.losses:      # only work for local loss
                     aux_outputs['is_dn'] = True
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
+                    if self.dn_enabled and loss != 'local':
+                        continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
@@ -466,6 +432,8 @@ class DEIMCriterion(nn.Module):
             if 'dn_pre_outputs' in outputs:
                 aux_outputs = outputs['dn_pre_outputs']
                 for loss in self.losses:
+                    if self.dn_enabled and loss != 'local':
+                        continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
@@ -502,9 +470,8 @@ class DEIMCriterion(nn.Module):
         return meta
 
     @staticmethod
-    def get_cdn_matched_indices(dn_meta, targets):
-        """get_cdn_matched_indices
-        """
+    def get_dn_matched_indices(dn_meta, targets):
+        """Match each known DN query to the GT from which it was generated."""
         dn_positive_idx, dn_num_group = dn_meta["dn_positive_idx"], dn_meta["dn_num_group"]
         num_gts = [len(t['labels']) for t in targets]
         device = targets[0]['labels'].device

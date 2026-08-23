@@ -100,9 +100,6 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())
-        lrrm_stats = getattr(criterion, 'lrrm_debug_stats', {})
-        if lrrm_stats:
-            lrrm_stats = dist_utils.reduce_dict(lrrm_stats)
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
@@ -110,7 +107,6 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             sys.exit(1)
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced)
-        metric_logger.update(**lrrm_stats)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
@@ -119,8 +115,6 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
-            for k, v in lrrm_stats.items():
-                writer.add_scalar(f'LRRM/{k}', v.item(), global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

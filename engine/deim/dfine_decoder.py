@@ -40,6 +40,24 @@ class MLP(nn.Module):
         return x
 
 
+class LocalizationResidualHead(nn.Module):
+    """Predict a bounded normalized-box residual from decoder features."""
+
+    def __init__(self, input_dim, hidden_dim, delta_scale=0.1):
+        super().__init__()
+        self.delta_scale = float(delta_scale)
+        self.layers = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 4),
+        )
+        nn.init.zeros_(self.layers[-1].weight)
+        nn.init.zeros_(self.layers[-1].bias)
+
+    def forward(self, features):
+        return self.delta_scale * torch.tanh(self.layers(features))
+
+
 class MSDeformableAttention(nn.Module):
     def __init__(
         self,
@@ -336,6 +354,7 @@ class TransformerDecoder(nn.Module):
                 integral,
                 up,
                 reg_scale,
+                lrrm_heads=None,
                 attn_mask=None,
                 memory_mask=None,
                 dn_meta=None):
@@ -344,8 +363,9 @@ class TransformerDecoder(nn.Module):
         value = self.value_op(memory, None, None, memory_mask, spatial_shapes)
 
         dec_out_bboxes = []
+        dec_out_refined_bboxes = []
+        dec_out_deltas = []
         dec_out_logits = []
-        dec_out_rank_logits = []
         dec_out_pred_corners = []
         dec_out_refs = []
         if not hasattr(self, 'project'):
@@ -379,16 +399,17 @@ class TransformerDecoder(nn.Module):
             inter_ref_bbox = distance2bbox(ref_points_initial, integral(pred_corners, project), reg_scale)
 
             if self.training or i == self.eval_idx:
-                raw_scores = score_head[i](output)
+                scores = score_head[i](output)
                 # Lqe does not affect the performance here.
-                scores = self.lqe_layers[i](raw_scores, pred_corners)
+                scores = self.lqe_layers[i](scores, pred_corners)
                 dec_out_logits.append(scores)
-                if self.training:
-                    # Match inference values while isolating QCCR from the
-                    # localization-specific LQE/FDR branch during backward.
-                    rank_scores = raw_scores + (scores - raw_scores).detach()
-                    dec_out_rank_logits.append(rank_scores)
                 dec_out_bboxes.append(inter_ref_bbox)
+                if lrrm_heads is None:
+                    delta_box = inter_ref_bbox.new_zeros(inter_ref_bbox.shape)
+                else:
+                    delta_box = lrrm_heads[i](output)
+                dec_out_deltas.append(delta_box)
+                dec_out_refined_bboxes.append(inter_ref_bbox + delta_box)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
 
@@ -399,9 +420,9 @@ class TransformerDecoder(nn.Module):
             ref_points_detach = inter_ref_bbox.detach()
             output_detach = output.detach()
 
-        rank_logits = torch.stack(dec_out_rank_logits) if self.training else None
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores, rank_logits
+               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), \
+               torch.stack(dec_out_refined_bboxes), torch.stack(dec_out_deltas), pre_bboxes, pre_scores
 
 
 @register()
@@ -435,7 +456,8 @@ class DFINETransformer(nn.Module):
                  reg_scale=4.,
                  layer_scale=1,
                  mlp_act='relu',
-                 qcmr_encoder_quality_enabled=False,
+                 lrrm_enabled=False,
+                 lrrm_delta_scale=0.1,
                  ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -456,7 +478,10 @@ class DFINETransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
-        self.qcmr_encoder_quality_enabled = qcmr_encoder_quality_enabled
+        self.lrrm_enabled = bool(lrrm_enabled)
+        self.lrrm_delta_scale = float(lrrm_delta_scale)
+        if self.lrrm_delta_scale <= 0:
+            raise ValueError('lrrm_delta_scale must be positive.')
 
         assert query_select_method in ('default', 'one2many', 'agnostic'), ''
         assert cross_attn_method in ('default', 'discrete'), ''
@@ -504,8 +529,6 @@ class DFINETransformer(nn.Module):
             self.enc_score_head = nn.Linear(hidden_dim, num_classes)
 
         self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, 3, act=mlp_act)
-        if self.qcmr_encoder_quality_enabled:
-            self.enc_quality_head = MLP(hidden_dim, hidden_dim, 1, 2, act=mlp_act)
 
         # decoder head
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
@@ -516,6 +539,13 @@ class DFINETransformer(nn.Module):
         self.dec_bbox_head = nn.ModuleList(
             [MLP(hidden_dim, hidden_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(self.eval_idx + 1)]
           + [MLP(scaled_dim, scaled_dim, 4 * (self.reg_max+1), 3, act=mlp_act) for _ in range(num_layers - self.eval_idx - 1)])
+        self.dec_lrrm_head = None
+        if self.lrrm_enabled:
+            self.dec_lrrm_head = nn.ModuleList(
+                [LocalizationResidualHead(hidden_dim, hidden_dim, self.lrrm_delta_scale)
+                 for _ in range(self.eval_idx + 1)]
+              + [LocalizationResidualHead(scaled_dim, scaled_dim, self.lrrm_delta_scale)
+                 for _ in range(num_layers - self.eval_idx - 1)])
         self.integral = Integral(self.reg_max)
 
         # init encoder output anchors and valid_mask
@@ -541,10 +571,6 @@ class DFINETransformer(nn.Module):
         init.constant_(self.enc_score_head.bias, bias)
         init.constant_(self.enc_bbox_head.layers[-1].weight, 0)
         init.constant_(self.enc_bbox_head.layers[-1].bias, 0)
-        if self.qcmr_encoder_quality_enabled:
-            # Keep the initial quality prior constant so Q2 starts with baseline ranking.
-            init.constant_(self.enc_quality_head.layers[-1].weight, 0)
-            init.constant_(self.enc_quality_head.layers[-1].bias, 0)
 
         init.constant_(self.pre_bbox_head.layers[-1].weight, 0)
         init.constant_(self.pre_bbox_head.layers[-1].bias, 0)
@@ -665,11 +691,10 @@ class DFINETransformer(nn.Module):
 
         output_memory :torch.Tensor = self.enc_output(memory)
         enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory)
-        enc_outputs_quality = self.enc_quality_head(output_memory) if self.qcmr_encoder_quality_enabled else None
 
-        enc_topk_bboxes_list, enc_topk_logits_list, enc_topk_quality_list = [], [], []
-        enc_topk_memory, enc_topk_logits, enc_topk_anchors, enc_topk_quality = \
-            self._select_topk(output_memory, enc_outputs_logits, anchors, self.num_queries, enc_outputs_quality)
+        enc_topk_bboxes_list, enc_topk_logits_list = [], []
+        enc_topk_memory, enc_topk_logits, enc_topk_anchors = \
+            self._select_topk(output_memory, enc_outputs_logits, anchors, self.num_queries)
 
         enc_topk_bbox_unact :torch.Tensor = self.enc_bbox_head(enc_topk_memory) + enc_topk_anchors
 
@@ -677,8 +702,6 @@ class DFINETransformer(nn.Module):
             enc_topk_bboxes = F.sigmoid(enc_topk_bbox_unact)
             enc_topk_bboxes_list.append(enc_topk_bboxes)
             enc_topk_logits_list.append(enc_topk_logits)
-            if enc_topk_quality is not None:
-                enc_topk_quality_list.append(enc_topk_quality)
 
         # if self.num_select_queries != self.num_queries:
         #     raise NotImplementedError('')
@@ -694,26 +717,18 @@ class DFINETransformer(nn.Module):
             enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
             content = torch.concat([denoising_logits, content], dim=1)
 
-        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list, enc_topk_quality_list
+        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
 
-    def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor,
-                     outputs_anchors_unact: torch.Tensor, topk: int, outputs_quality=None):
+    def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor, outputs_anchors_unact: torch.Tensor, topk: int):
         if self.query_select_method == 'default':
-            ranking_score = outputs_logits.max(-1).values
-        elif self.query_select_method == 'one2many':
-            ranking_score = outputs_logits.flatten(1)
-        elif self.query_select_method == 'agnostic':
-            ranking_score = outputs_logits.squeeze(-1)
-
-        if self.query_select_method == 'default':
-            _, topk_ind = torch.topk(ranking_score, topk, dim=-1)
+            _, topk_ind = torch.topk(outputs_logits.max(-1).values, topk, dim=-1)
 
         elif self.query_select_method == 'one2many':
-            _, topk_ind = torch.topk(ranking_score, topk, dim=-1)
+            _, topk_ind = torch.topk(outputs_logits.flatten(1), topk, dim=-1)
             topk_ind = topk_ind // self.num_classes
 
         elif self.query_select_method == 'agnostic':
-            _, topk_ind = torch.topk(ranking_score, topk, dim=-1)
+            _, topk_ind = torch.topk(outputs_logits.squeeze(-1), topk, dim=-1)
 
         topk_ind: torch.Tensor
 
@@ -726,12 +741,7 @@ class DFINETransformer(nn.Module):
         topk_memory = memory.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, memory.shape[-1]))
 
-        topk_quality = None
-        if outputs_quality is not None:
-            topk_quality = outputs_quality.gather(
-                dim=1, index=topk_ind.unsqueeze(-1).repeat(1, 1, outputs_quality.shape[-1]))
-
-        return topk_memory, topk_logits, topk_anchors, topk_quality
+        return topk_memory, topk_logits, topk_anchors
 
     def forward(self, feats, targets=None):
         # input projection and embedding
@@ -751,11 +761,11 @@ class DFINETransformer(nn.Module):
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list, enc_topk_quality_list = \
+        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits, out_rank_logits = self.decoder(
+        out_bboxes, out_logits, out_corners, out_refs, out_refined_bboxes, out_deltas, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -767,6 +777,7 @@ class DFINETransformer(nn.Module):
             self.integral,
             self.up,
             self.reg_scale,
+            self.dec_lrrm_head if self.lrrm_enabled else None,
             attn_mask=attn_mask,
             dn_meta=dn_meta)
 
@@ -776,23 +787,27 @@ class DFINETransformer(nn.Module):
             dn_pre_bboxes, pre_bboxes = torch.split(pre_bboxes, dn_meta['dn_num_split'], dim=1)
 
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
-            dn_out_rank_logits, out_rank_logits = torch.split(out_rank_logits, dn_meta['dn_num_split'], dim=2)
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
+            dn_out_refined_bboxes, out_refined_bboxes = torch.split(out_refined_bboxes, dn_meta['dn_num_split'], dim=2)
+            dn_out_deltas, out_deltas = torch.split(out_deltas, dn_meta['dn_num_split'], dim=2)
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
+
+
         if self.training:
-            out = {'pred_logits': out_logits[-1], 'pred_rank_logits': out_rank_logits[-1],
-                   'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],
+                   'pred_refined_boxes': out_refined_bboxes[-1], 'pred_delta_boxes': out_deltas[-1],
+                   'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
-            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1],
+                   'pred_refined_boxes': out_refined_bboxes[-1], 'pred_delta_boxes': out_deltas[-1]}
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
                                                      out_corners[-1], out_logits[-1])
-            out['enc_aux_outputs'] = self._set_aux_loss(
-                enc_topk_logits_list, enc_topk_bboxes_list, enc_topk_quality_list or None)
+            out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes}
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
@@ -806,17 +821,11 @@ class DFINETransformer(nn.Module):
 
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_quality=None):
+    def _set_aux_loss(self, outputs_class, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        result = []
-        for i, (a, b) in enumerate(zip(outputs_class, outputs_coord)):
-            item = {'pred_logits': a, 'pred_boxes': b}
-            if outputs_quality is not None:
-                item['pred_quality'] = outputs_quality[i]
-            result.append(item)
-        return result
+        return [{'pred_logits': a, 'pred_boxes': b} for a, b in zip(outputs_class, outputs_coord)]
 
 
     @torch.jit.unused
@@ -826,5 +835,5 @@ class DFINETransformer(nn.Module):
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
-                 'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
+                     'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}
                 for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)]

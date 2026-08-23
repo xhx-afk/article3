@@ -45,6 +45,7 @@ class HungarianMatcher(nn.Module):
         self.use_focal_loss = use_focal_loss
         self.alpha = alpha
         self.gamma = gamma
+
         assert self.cost_class != 0 or self.cost_bbox != 0 or self.cost_giou != 0, "all costs cant be 0"
 
     @torch.no_grad()
@@ -86,13 +87,12 @@ class HungarianMatcher(nn.Module):
         # but approximate it in 1 - proba[target class].
         # The 1 is a constant that doesn't change the matching, it can be ommitted.
         if self.use_focal_loss:
-            class_prob_for_target = out_prob[:, tgt_ids]
-            neg_cost_class = (1 - self.alpha) * (class_prob_for_target ** self.gamma) * (-(1 - class_prob_for_target + 1e-8).log())
-            pos_cost_class = self.alpha * ((1 - class_prob_for_target) ** self.gamma) * (-(class_prob_for_target + 1e-8).log())
+            out_prob = out_prob[:, tgt_ids]
+            neg_cost_class = (1 - self.alpha) * (out_prob ** self.gamma) * (-(1 - out_prob + 1e-8).log())
+            pos_cost_class = self.alpha * ((1 - out_prob) ** self.gamma) * (-(out_prob + 1e-8).log())
             cost_class = pos_cost_class - neg_cost_class
         else:
-            class_prob_for_target = out_prob[:, tgt_ids]
-            cost_class = -class_prob_for_target
+            cost_class = -out_prob[:, tgt_ids]
 
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)

@@ -39,21 +39,9 @@ class DEIMCriterion(nn.Module):
         share_matched_indices=False,
         mal_alpha=None,
         use_uni_set=True,
-        qcmr_encoder_quality_enabled=False,
-        qcmr_encoder_quality_loss_weight=0.5,
-        qcmr_encoder_quality_neg_weight=0.25,
-        qcmr_encoder_quality_target_gamma=1.0,
-        qcmr_local_rank_enabled=False,
-        qcmr_rank_loss_weight=0.05,
-        qcmr_rank_start_epoch=5,
-        qcmr_rank_min_pos_iou=0.50,
-        qcmr_rank_min_comp_iou=0.50,
-        qcmr_rank_topk_competitors=3,
-        qcmr_rank_better_comp_tolerance=0.05,
-        qcmr_rank_temperature=0.20,
-        qcmr_rank_pos_quality_power=1.0,
-        qcmr_rank_comp_quality_power=1.0,
-        qcmr_rank_eps=1e-6,
+        lrrm_enabled=False,
+        lrrm_loss_weight=1.0,
+        lrrm_start_epoch=10,
         ):
         """Create the criterion.
         Parameters:
@@ -79,38 +67,12 @@ class DEIMCriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
-        self.qcmr_encoder_quality_enabled = qcmr_encoder_quality_enabled
-        self.qcmr_encoder_quality_loss_weight = qcmr_encoder_quality_loss_weight
-        self.qcmr_encoder_quality_neg_weight = qcmr_encoder_quality_neg_weight
-        self.qcmr_encoder_quality_target_gamma = qcmr_encoder_quality_target_gamma
-        self.qcmr_local_rank_enabled = qcmr_local_rank_enabled
-        self.qcmr_rank_loss_weight = qcmr_rank_loss_weight
-        self.qcmr_rank_start_epoch = int(qcmr_rank_start_epoch)
-        self.qcmr_rank_min_pos_iou = qcmr_rank_min_pos_iou
-        self.qcmr_rank_min_comp_iou = qcmr_rank_min_comp_iou
-        self.qcmr_rank_topk_competitors = int(qcmr_rank_topk_competitors)
-        self.qcmr_rank_better_comp_tolerance = qcmr_rank_better_comp_tolerance
-        self.qcmr_rank_temperature = qcmr_rank_temperature
-        self.qcmr_rank_pos_quality_power = qcmr_rank_pos_quality_power
-        self.qcmr_rank_comp_quality_power = qcmr_rank_comp_quality_power
-        self.qcmr_rank_eps = qcmr_rank_eps
-        self.qcmr_debug_stats = {}
-        if self.qcmr_encoder_quality_enabled:
-            if self.qcmr_encoder_quality_loss_weight < 0 or self.qcmr_encoder_quality_neg_weight < 0:
-                raise ValueError('Encoder quality loss weights must be non-negative.')
-            if self.qcmr_encoder_quality_target_gamma <= 0:
-                raise ValueError('qcmr_encoder_quality_target_gamma must be positive.')
-        if self.qcmr_local_rank_enabled:
-            if self.qcmr_rank_loss_weight < 0 or self.qcmr_rank_start_epoch < 0:
-                raise ValueError('QCCR rank loss weight and start epoch must be non-negative.')
-            if not 0 <= self.qcmr_rank_min_pos_iou <= 1 or not 0 <= self.qcmr_rank_min_comp_iou <= 1:
-                raise ValueError('QCCR IoU thresholds must be in [0, 1].')
-            if self.qcmr_rank_topk_competitors <= 0 or self.qcmr_rank_temperature <= 0:
-                raise ValueError('QCCR top-k and temperature must be positive.')
-            if self.qcmr_rank_better_comp_tolerance < 0 or self.qcmr_rank_eps <= 0:
-                raise ValueError('QCCR tolerance and eps must be non-negative/positive.')
-            if self.qcmr_rank_pos_quality_power < 0 or self.qcmr_rank_comp_quality_power < 0:
-                raise ValueError('QCCR quality powers must be non-negative.')
+        self.lrrm_enabled = bool(lrrm_enabled)
+        self.lrrm_loss_weight = float(lrrm_loss_weight)
+        self.lrrm_start_epoch = int(lrrm_start_epoch)
+        self.lrrm_debug_stats = {}
+        if self.lrrm_loss_weight < 0 or self.lrrm_start_epoch < 0:
+            raise ValueError('LRRM loss weight and start epoch must be non-negative.')
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -261,206 +223,63 @@ class DEIMCriterion(nn.Module):
 
         return losses
 
-    def _qcmr_quality_loss(self, outputs, targets, indices, stats_prefix=''):
-        """Supervise a class-agnostic quality logit with matched-box IoU."""
-        quality_logits = outputs['pred_quality']
-        if quality_logits.shape[-1] != 1:
-            raise ValueError('pred_quality must have shape [batch, queries, 1].')
-        quality_logits = quality_logits.squeeze(-1)
-
-        quality_targets = torch.zeros_like(quality_logits)
-        positive_mask = torch.zeros_like(quality_logits, dtype=torch.bool)
-        matched_iou_for_stats = quality_logits.new_empty(0)
-        idx = self._get_src_permutation_idx(indices)
-        if idx[0].numel() > 0:
-            src_boxes = outputs['pred_boxes'][idx].detach()
-            target_boxes = torch.cat(
-                [target['boxes'][target_idx] for target, (_, target_idx) in zip(targets, indices)],
-                dim=0,
-            )
-            matched_iou, _ = box_iou(
-                box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
-            matched_iou = torch.diag(matched_iou).clamp(0, 1)
-            matched_iou_for_stats = matched_iou
-            quality_targets[idx] = matched_iou.pow(
-                self.qcmr_encoder_quality_target_gamma).to(quality_targets.dtype)
-            positive_mask[idx] = True
-
-        elementwise_loss = F.binary_cross_entropy_with_logits(
-            quality_logits, quality_targets, reduction='none')
-        zero = quality_logits.sum() * 0.0
-        positive_loss = elementwise_loss[positive_mask].mean() if positive_mask.any() else zero
-        negative_mask = ~positive_mask
-        negative_loss = elementwise_loss[negative_mask].mean() if negative_mask.any() else zero
-
-        with torch.no_grad():
-            quality_probs = quality_logits.float().sigmoid()
-            stats_zero = quality_probs.sum() * 0.0
-            positive_quality = quality_probs[idx]
-            negative_quality = quality_probs[negative_mask]
-            positive_mean = positive_quality.mean() if positive_quality.numel() else stats_zero
-            negative_mean = negative_quality.mean() if negative_quality.numel() else stats_zero
-
-            correlation = stats_zero
-            if positive_quality.numel() >= 2:
-                matched_iou_float = matched_iou_for_stats.float()
-                quality_centered = positive_quality - positive_quality.mean()
-                iou_centered = matched_iou_float - matched_iou_float.mean()
-                denominator = torch.sqrt(
-                    quality_centered.square().sum() * iou_centered.square().sum())
-                eps = torch.finfo(quality_centered.dtype).eps
-                correlation = torch.where(
-                    denominator > eps,
-                    (quality_centered * iou_centered).sum() / denominator.clamp_min(eps),
-                    stats_zero,
-                )
-
-            stats = {
-                f'qcmr_{stats_prefix}quality_pos_mean': positive_mean.detach(),
-                f'qcmr_{stats_prefix}quality_neg_mean': negative_mean.detach(),
-                f'qcmr_{stats_prefix}quality_iou_corr': correlation.detach(),
-            }
-            self.qcmr_debug_stats.update(stats)
-        return positive_loss + self.qcmr_encoder_quality_neg_weight * negative_loss
-
-    def loss_qcmr_quality_enc(self, outputs, targets, indices):
-        loss = self._qcmr_quality_loss(outputs, targets, indices, stats_prefix='encoder_')
-        return {
-            'loss_qcmr_quality_enc': self.qcmr_encoder_quality_loss_weight
-            * loss
-        }
-
-    def loss_qcmr_competitive_rank(self, outputs, targets, indices, epoch=0):
-        """Rank Hungarian winners above nearby unmatched duplicate queries."""
-        if not self.qcmr_local_rank_enabled:
-            logits = outputs['pred_logits']
-            return {'loss_qcmr_rank': logits.sum() * 0.0}
-        if 'pred_rank_logits' not in outputs:
-            raise KeyError(
-                'QCCR requires training-only `pred_rank_logits` from DFINETransformer.')
-        logits = outputs['pred_rank_logits']
-        zero = logits.sum() * 0.0
-        zero_stat = zero.detach()
-        with torch.no_grad():
-            rank_logit_parity = (outputs['pred_rank_logits'] - outputs['pred_logits']).abs().max()
-        stats = {
-            'qcmr_rank_active': logits.new_tensor(float(
-                self.qcmr_local_rank_enabled and epoch >= self.qcmr_rank_start_epoch)),
-            'qcmr_rank_num_pairs': zero_stat,
-            'qcmr_rank_num_gt_with_pairs': zero_stat,
-            'qcmr_rank_matched_pos_iou_mean': zero_stat,
-            'qcmr_rank_comp_iou_mean': zero_stat,
-            'qcmr_rank_pos_logit_mean': zero_stat,
-            'qcmr_rank_comp_logit_mean': zero_stat,
-            'qcmr_rank_score_gap_mean': zero_stat,
-            'qcmr_rank_violation_rate': zero_stat,
-            'qcmr_rank_better_unmatched_count': zero_stat,
-            'qcmr_rank_better_unmatched_rate': zero_stat,
-            'qcmr_rank_matched_winner_rate': zero_stat,
-            'qcmr_rank_logit_parity_max_abs': rank_logit_parity.detach(),
-        }
-        self.qcmr_debug_stats.update(stats)
-        if epoch < self.qcmr_rank_start_epoch:
-            return {'loss_qcmr_rank': zero}
-
-        pair_losses, pair_weights = [], []
-        pos_ious, comp_ious, pos_logits, comp_logits, gaps = [], [], [], [], []
-        violations = 0
-        better_count = 0
-        gt_with_candidates = 0
-        gt_with_any_candidates = 0
-        better_gt_count = 0
-        winner_count = 0
-
-        for batch_idx, (src_idx, tgt_idx) in enumerate(indices):
-            gt_boxes = targets[batch_idx]['boxes']
-            gt_labels = targets[batch_idx]['labels']
-            if gt_boxes.numel() == 0 or src_idx.numel() == 0:
-                continue
-            pred_boxes = outputs['pred_boxes'][batch_idx].detach()
-            iou_matrix, _ = box_iou(
-                box_cxcywh_to_xyxy(pred_boxes),
-                box_cxcywh_to_xyxy(gt_boxes))
-            best_iou, best_gt = iou_matrix.max(dim=1)
-            matched_mask = torch.zeros(logits.shape[1], dtype=torch.bool, device=logits.device)
-            matched_mask[src_idx] = True
-            matched_for_gt = {int(g): int(q) for q, g in zip(src_idx.tolist(), tgt_idx.tolist())}
-
-            for gt_idx, pos_query in matched_for_gt.items():
-                iou_pos = iou_matrix[pos_query, gt_idx]
-                if iou_pos < self.qcmr_rank_min_pos_iou:
-                    continue
-                owner_mask = best_gt == gt_idx
-                candidate_mask = (~matched_mask) & owner_mask & (
-                    iou_matrix[:, gt_idx] >= self.qcmr_rank_min_comp_iou)
-                candidates = torch.nonzero(candidate_mask, as_tuple=False).flatten()
-                if candidates.numel() == 0:
-                    continue
-                candidate_ious = iou_matrix[candidates, gt_idx]
-                gt_with_any_candidates += 1
-                better_mask = candidate_ious > iou_pos + self.qcmr_rank_better_comp_tolerance
-                better_count += int(better_mask.sum().item())
-                better_gt_count += int(better_mask.any().item())
-                candidates = candidates[~better_mask]
-                candidate_ious = candidate_ious[~better_mask]
-                if candidates.numel() == 0:
-                    continue
-                gt_with_candidates += 1
-                pos_logit = logits[batch_idx, pos_query, gt_labels[gt_idx]]
-                candidate_scores = logits[batch_idx, candidates, gt_labels[gt_idx]]
-                order = torch.argsort(candidate_scores, descending=True)
-                candidates = candidates[order[:self.qcmr_rank_topk_competitors]]
-                candidate_ious = iou_matrix[candidates, gt_idx]
-                candidate_scores = logits[batch_idx, candidates, gt_labels[gt_idx]]
-                winner_count += int((pos_logit > candidate_scores.max()).item())
-                for iou_comp, neg_logit in zip(candidate_ious, candidate_scores):
-                    pair_loss = self.qcmr_rank_temperature * F.softplus(
-                        (neg_logit - pos_logit) / self.qcmr_rank_temperature)
-                    pair_weight = iou_pos.detach().pow(self.qcmr_rank_pos_quality_power) \
-                        * iou_comp.detach().pow(self.qcmr_rank_comp_quality_power)
-                    pair_losses.append(pair_loss)
-                    pair_weights.append(pair_weight)
-                    pos_ious.append(iou_pos.detach())
-                    comp_ious.append(iou_comp.detach())
-                    pos_logits.append(pos_logit.detach())
-                    comp_logits.append(neg_logit.detach())
-                    gaps.append((pos_logit - neg_logit).detach())
-                    violations += int((neg_logit >= pos_logit).item())
-
-        if not pair_losses:
-            self.qcmr_debug_stats.update({
-                'qcmr_rank_better_unmatched_count': logits.new_tensor(float(better_count)),
-                'qcmr_rank_better_unmatched_rate': logits.new_tensor(
-                    float(better_gt_count / max(gt_with_any_candidates, 1))),
-            })
-            return {'loss_qcmr_rank': zero}
-
-        pair_losses = torch.stack(pair_losses)
-        pair_weights = torch.stack(pair_weights)
-        normalized_loss = (pair_weights * pair_losses).sum() / pair_weights.sum().clamp_min(self.qcmr_rank_eps)
-        pair_count = len(pair_losses)
-        self.qcmr_debug_stats.update({
-            'qcmr_rank_num_pairs': logits.new_tensor(float(pair_count)),
-            'qcmr_rank_num_gt_with_pairs': logits.new_tensor(float(gt_with_candidates)),
-            'qcmr_rank_matched_pos_iou_mean': torch.stack(pos_ious).mean(),
-            'qcmr_rank_comp_iou_mean': torch.stack(comp_ious).mean(),
-            'qcmr_rank_pos_logit_mean': torch.stack(pos_logits).mean(),
-            'qcmr_rank_comp_logit_mean': torch.stack(comp_logits).mean(),
-            'qcmr_rank_score_gap_mean': torch.stack(gaps).mean(),
-            'qcmr_rank_violation_rate': logits.new_tensor(float(violations / pair_count)),
-            'qcmr_rank_better_unmatched_count': logits.new_tensor(float(better_count)),
-            'qcmr_rank_better_unmatched_rate': logits.new_tensor(
-                float(better_gt_count / max(gt_with_any_candidates, 1))),
-            'qcmr_rank_matched_winner_rate': logits.new_tensor(
-                float(winner_count / max(gt_with_candidates, 1))),
-        })
-        return {'loss_qcmr_rank': self.qcmr_rank_loss_weight * normalized_loss}
-
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
+
+    def loss_localization_refinement(self, outputs, targets, indices, epoch=0, num_boxes=None):
+        """Refine matched boxes without changing the original DEIM target path."""
+        if not self.lrrm_enabled:
+            return {}
+        if 'pred_refined_boxes' not in outputs:
+            raise KeyError('LRRM requires `pred_refined_boxes` from DFINETransformer.')
+
+        refined_boxes = outputs['pred_refined_boxes']
+        delta_boxes = outputs.get('pred_delta_boxes')
+        zero = refined_boxes.sum() * 0.0
+        if delta_boxes is None:
+            delta_boxes = refined_boxes - outputs['pred_boxes']
+        with torch.no_grad():
+            self.lrrm_debug_stats = {
+                'mean_delta_box': delta_boxes.detach().abs().mean(),
+                'max_delta_box': delta_boxes.detach().abs().max(),
+            }
+
+        if epoch < self.lrrm_start_epoch:
+            self.lrrm_debug_stats.update({
+                'train_loss_ref_l1': zero.detach(),
+                'train_loss_ref_giou': zero.detach(),
+            })
+            return {'loss_ref_l1': zero, 'loss_ref_giou': zero}
+
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel() == 0:
+            self.lrrm_debug_stats.update({
+                'train_loss_ref_l1': zero.detach(),
+                'train_loss_ref_giou': zero.detach(),
+            })
+            return {'loss_ref_l1': zero, 'loss_ref_giou': zero}
+
+        if num_boxes is None:
+            num_boxes = max(sum(len(target['labels']) for target in targets), 1)
+        src_boxes = refined_boxes[idx]
+        target_boxes = torch.cat(
+            [target['boxes'][target_idx] for target, (_, target_idx) in zip(targets, indices)],
+            dim=0,
+        )
+        loss_ref_l1 = F.smooth_l1_loss(src_boxes, target_boxes, reduction='sum') / max(float(num_boxes), 1.0)
+        loss_ref_giou = 1 - torch.diag(generalized_box_iou(
+            box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes)))
+        loss_ref_giou = loss_ref_giou.sum() / max(float(num_boxes), 1.0)
+        weighted_l1 = self.lrrm_loss_weight * loss_ref_l1
+        weighted_giou = self.lrrm_loss_weight * loss_ref_giou
+        self.lrrm_debug_stats.update({
+            'train_loss_ref_l1': weighted_l1.detach(),
+            'train_loss_ref_giou': weighted_giou.detach(),
+        })
+        return {'loss_ref_l1': weighted_l1, 'loss_ref_giou': weighted_giou}
 
     def _get_tgt_permutation_idx(self, indices):
         # permute targets following indices
@@ -512,7 +331,7 @@ class DEIMCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
-        self.qcmr_debug_stats = {}
+        self.lrrm_debug_stats = {}
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
         # Retrieve the matching between the outputs of the last layer and the targets
@@ -562,9 +381,9 @@ class DEIMCriterion(nn.Module):
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
 
-        if self.qcmr_local_rank_enabled:
-            losses.update(self.loss_qcmr_competitive_rank(
-                outputs, targets, indices, epoch=kwargs.get('epoch', 0)))
+        if self.lrrm_enabled:
+            losses.update(self.loss_localization_refinement(
+                outputs, targets, indices, epoch=kwargs.get('epoch', 0), num_boxes=num_boxes))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -622,16 +441,6 @@ class DEIMCriterion(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_enc_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-
-                if self.qcmr_encoder_quality_enabled and 'pred_quality' in aux_outputs:
-                    quality_loss = self.loss_qcmr_quality_enc(
-                        aux_outputs, enc_targets, cached_indices_enc[i])
-                    # There is currently one selected-query encoder output. Keep
-                    # the canonical key stable if more encoder outputs are added.
-                    if i == 0:
-                        losses.update(quality_loss)
-                    else:
-                        losses.update({f'{key}_{i}': value for key, value in quality_loss.items()})
 
             if class_agnostic:
                 self.num_classes = orig_num_classes

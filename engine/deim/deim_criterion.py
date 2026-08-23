@@ -284,6 +284,11 @@ class DEIMCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
+        has_targets = any(len(target['labels']) > 0 for target in targets)
+        if self.dn_enabled and has_targets and (
+                'dn_outputs' not in outputs or 'dn_meta' not in outputs):
+            raise RuntimeError(
+                'DN Query is enabled, but decoder DN outputs are missing.')
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)['indices']

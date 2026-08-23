@@ -21,6 +21,36 @@ from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
 
+def _print_dn_debug(outputs, criterion, loss_dict, epoch, step):
+    """Print the DN closed-loop state once at the start of training."""
+    if epoch != 0 or step != 0 or not dist_utils.is_main_process():
+        return
+
+    dn_enabled = bool(getattr(criterion, 'dn_enabled', False))
+    dn_meta = outputs.get('dn_meta')
+    dn_query_num = int(dn_meta['dn_num_split'][0]) if dn_meta else 0
+    dn_num_group = int(dn_meta['dn_num_group']) if dn_meta else 0
+    dn_positive_num = (
+        sum(index.numel() for index in dn_meta.get('dn_positive_idx', ()))
+        if dn_meta else 0
+    )
+
+    def loss_value(key):
+        value = loss_dict.get(key)
+        return float(value.detach().item()) if value is not None else 0.0
+
+    print(
+        '[DN Debug]\n'
+        f'dn_enabled={dn_enabled}\n'
+        f'dn_query_num={dn_query_num}\n'
+        f'dn_num_group={dn_num_group}\n'
+        f'dn_loss_cls={loss_value("loss_dn_cls"):.6f}\n'
+        f'dn_loss_bbox={loss_value("loss_dn_bbox"):.6f}\n'
+        f'dn_loss_giou={loss_value("loss_dn_giou"):.6f}\n'
+        f'dn_positive_num={dn_positive_num}'
+    )
+
+
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
@@ -100,6 +130,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
         loss_value = sum(loss_dict_reduced.values())
+        _print_dn_debug(outputs, criterion, loss_dict_reduced, epoch, i)
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))

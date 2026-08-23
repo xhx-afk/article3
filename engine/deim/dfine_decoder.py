@@ -636,8 +636,8 @@ class DFINETransformer(nn.Module):
     def _get_decoder_input(self,
                            memory: torch.Tensor,
                            spatial_shapes,
-                           denoising_logits=None,
-                           denoising_bbox_unact=None):
+                           dn_label_query=None,
+                           dn_bbox_query_unact=None):
 
         # prepare input for decoder
         if self.training or self.eval_spatial_size is None:
@@ -676,9 +676,14 @@ class DFINETransformer(nn.Module):
 
         enc_topk_bbox_unact = enc_topk_bbox_unact.detach()
 
-        if denoising_bbox_unact is not None:
-            enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
-            content = torch.concat([denoising_logits, content], dim=1)
+        if dn_bbox_query_unact is not None:
+            if dn_label_query is None:
+                raise ValueError('DN label and bbox queries must be provided together.')
+            # The decoder applies sigmoid to this combined tensor to obtain
+            # the initial reference points used by every DN and normal query.
+            enc_topk_bbox_unact = torch.concat(
+                [dn_bbox_query_unact, enc_topk_bbox_unact], dim=1)
+            content = torch.concat([dn_label_query, content], dim=1)
 
         return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
 
@@ -713,14 +718,14 @@ class DFINETransformer(nn.Module):
         # prepare denoising training
         if self.training and self.num_denoising > 0:
             if self.dn_enabled:
-                denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = prepare_for_dn(
+                dn_label_query, dn_bbox_query_unact, dn_attn_mask, dn_meta = prepare_for_dn(
                     targets, self.denoising_class_embed, len(targets), self.training,
                     self.num_queries, self.num_classes, self.hidden_dim,
                     dn_number=self.num_denoising,
                     label_noise_ratio=self.label_noise_ratio,
                     box_noise_scale=self.box_noise_scale)
             else:
-                denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
+                dn_label_query, dn_bbox_query_unact, dn_attn_mask, dn_meta = \
                     get_contrastive_denoising_training_group(
                         targets, self.num_classes, self.num_queries,
                         self.denoising_class_embed,
@@ -728,10 +733,11 @@ class DFINETransformer(nn.Module):
                         label_noise_ratio=self.label_noise_ratio,
                         box_noise_scale=self.box_noise_scale)
         else:
-            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
+            dn_label_query, dn_bbox_query_unact, dn_attn_mask, dn_meta = None, None, None, None
 
         init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
-            self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+            self._get_decoder_input(
+                memory, spatial_shapes, dn_label_query, dn_bbox_query_unact)
 
         # decoder
         out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
@@ -746,7 +752,7 @@ class DFINETransformer(nn.Module):
             self.integral,
             self.up,
             self.reg_scale,
-            attn_mask=attn_mask,
+            attn_mask=dn_attn_mask,
             dn_meta=dn_meta)
 
         if self.training and dn_meta is not None:

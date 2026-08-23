@@ -1,5 +1,8 @@
-"""Synthetic DN Query v1 checks; no dataset or checkpoint required."""
+"""Synthetic DN Query v1.1 checks; no dataset or checkpoint required."""
 
+import contextlib
+import importlib.util
+import io
 import pathlib
 import sys
 import types
@@ -123,10 +126,24 @@ def test_split_and_model_contract():
     assert dn_box.shape[-2] == 5 and normal_box.shape[-2] == 3
 
     model = _model().train()
+    decoder_inputs = {}
+
+    def capture_decoder_inputs(module, args):
+        decoder_inputs['content'] = args[0].detach()
+        decoder_inputs['reference_unact'] = args[1].detach()
+
+    hook = model.decoder.register_forward_pre_hook(capture_decoder_inputs)
     outputs = model([torch.randn(1, 8, 4, 4)], _targets())
+    hook.remove()
     assert 'dn_outputs' in outputs and 'dn_meta' in outputs
     assert outputs['pred_logits'].shape[1] == 3
     assert outputs['dn_outputs'][0]['pred_logits'].shape[1] > 0
+    dn_count = outputs['dn_meta']['dn_num_split'][0]
+    assert decoder_inputs['content'].shape[1] == dn_count + 3
+    assert decoder_inputs['reference_unact'].shape[1] == dn_count + 3
+    dn_reference_points = decoder_inputs['reference_unact'][:, :dn_count].sigmoid()
+    assert torch.isfinite(dn_reference_points).all()
+    assert (dn_reference_points[..., 2:] > 0).all()
 
     model.eval()
     with torch.no_grad():
@@ -152,6 +169,73 @@ def test_explicit_dn_losses():
     total = sum(losses[key] for key in dn_keys)
     assert torch.isfinite(total)
     total.backward()
+    grad = model.denoising_class_embed.weight.grad
+    assert grad is not None and grad.abs().sum() > 0
+
+
+def test_missing_dn_outputs_fail_fast():
+    targets = _targets()
+    outputs = {
+        'pred_logits': torch.randn(1, 3, 3),
+        'pred_boxes': torch.rand(1, 3, 4),
+        'aux_outputs': [],
+        'enc_aux_outputs': [],
+    }
+    try:
+        _criterion()(outputs, targets, epoch=0)
+    except RuntimeError as exc:
+        assert 'decoder DN outputs are missing' in str(exc)
+    else:
+        raise AssertionError('Missing DN outputs must fail when DN is enabled.')
+
+
+def test_first_step_dn_debug_output():
+    tensorboard = types.ModuleType('torch.utils.tensorboard')
+    tensorboard.SummaryWriter = object
+    sys.modules['torch.utils.tensorboard'] = tensorboard
+
+    optim = types.ModuleType('engine.optim')
+    optim.ModelEMA = optim.Warmup = object
+    sys.modules['engine.optim'] = optim
+    data = types.ModuleType('engine.data')
+    data.CocoEvaluator = object
+    sys.modules['engine.data'] = data
+    misc = types.ModuleType('engine.misc')
+    misc.MetricLogger = misc.SmoothedValue = object
+    misc.dist_utils = types.SimpleNamespace(is_main_process=lambda: True)
+    sys.modules['engine.misc'] = misc
+    solver = types.ModuleType('engine.solver')
+    solver.__path__ = [str(ROOT / 'engine' / 'solver')]
+    sys.modules['engine.solver'] = solver
+
+    spec = importlib.util.spec_from_file_location(
+        'engine.solver.det_engine', ROOT / 'engine' / 'solver' / 'det_engine.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    outputs = {
+        'dn_meta': {
+            'dn_num_split': [50, 3],
+            'dn_num_group': 25,
+            'dn_positive_idx': (torch.arange(50), torch.arange(25)),
+        }
+    }
+    criterion = types.SimpleNamespace(dn_enabled=True)
+    losses = {
+        'loss_dn_cls': torch.tensor(1.25),
+        'loss_dn_bbox': torch.tensor(0.5),
+        'loss_dn_giou': torch.tensor(0.75),
+    }
+    capture = io.StringIO()
+    with contextlib.redirect_stdout(capture):
+        module._print_dn_debug(outputs, criterion, losses, epoch=0, step=0)
+        module._print_dn_debug(outputs, criterion, losses, epoch=0, step=1)
+    debug_text = capture.getvalue()
+    assert debug_text.count('[DN Debug]') == 1
+    for expected in (
+            'dn_enabled=True', 'dn_query_num=50', 'dn_num_group=25',
+            'dn_loss_cls=1.250000', 'dn_loss_bbox=0.500000',
+            'dn_loss_giou=0.750000', 'dn_positive_num=75'):
+        assert expected in debug_text
 
 
 def test_dn_with_deim_losses():
@@ -162,6 +246,10 @@ def test_dn_with_deim_losses():
     assert {'loss_mal', 'loss_bbox', 'loss_giou', 'loss_fgl'} <= losses.keys()
     assert {'loss_dn_cls', 'loss_dn_bbox', 'loss_dn_giou'} <= losses.keys()
     assert all(torch.isfinite(value).all() for value in losses.values())
+    total_loss = sum(losses.values())
+    total_loss.backward()
+    grad = model.denoising_class_embed.weight.grad
+    assert grad is not None and grad.abs().sum() > 0
 
 
 def main():
@@ -170,8 +258,10 @@ def main():
     test_split_and_model_contract()
     test_legacy_config_compatibility()
     test_explicit_dn_losses()
+    test_missing_dn_outputs_fail_fast()
+    test_first_step_dn_debug_output()
     test_dn_with_deim_losses()
-    print('DEIM DINO DN Query v1 smoke tests passed.')
+    print('DEIM DN Query v1.1 smoke tests passed.')
 
 
 if __name__ == '__main__':

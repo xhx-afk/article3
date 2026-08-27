@@ -1,0 +1,240 @@
+# DEIM-S 自定义数据集配置（木材 / 钢材表面缺陷统一 baseline）
+# ---------------------------------------------------------------------------
+# 与 deim_hgnetv2_l_wood.yml 保持完全相同的可调入口布局，
+# 但把官方 DEIM-S 的完整配方（主干 / 编码器 / 解码器层数 / 优化器 / 轮数 / 增强调度）
+# 全部写死在本文件内，不再依赖 ../base/optimizer.yml 里那套 L 的参数，
+# 因此不需要每次在命令行 -u 覆盖。
+#
+# 官方对应：configs/deim_dfine/dfine_hgnetv2_s_coco.yml + deim_hgnetv2_s_coco.yml
+#
+# 训练（两卡）：
+#   torchrun --master_port=7777 --nproc_per_node=2 train.py \
+#     -c configs/deim_dfine/deim_hgnetv2_s_custom.yml \
+#     -t /path/to/deim_dfine_hgnetv2_s_coco.pth \
+#     --use-amp --seed 0
+# 仅评估：追加 --test-only 并用 -r 指定权重
+# ---------------------------------------------------------------------------
+
+__include__:
+  [
+    "../dataset/custom_detection.yml",
+    "../runtime.yml",
+    "../base/dataloader.yml",
+    "../base/optimizer.yml",
+    "../base/dfine_hgnetv2.yml",
+    "../base/deim.yml",
+  ]
+
+# ==================== 用户可改配置区 ====================
+# 实验输出目录。
+output_dir: ./deim_outputs/deim_hgnetv2_s_custom_640_seed0
+
+# 数据集类别数，不包含背景类。
+num_classes: 6
+remap_mscoco_category: False
+
+# 训练总轮数。注意 DEIM 训练代码读取字段名 epoches，不是 D-FINE 的 epochs。
+# 官方 DEIM-S(COCO) = 132。小数据集建议 132 ~ 200。
+# ！改这里之后，下面四个锚点必须按公式同步重算，漏一个训练曲线就会异常。
+epoches: 132
+
+# --- 增强与学习率调度锚点（四处耦合）---
+#   stage_start_epoch  : 官方固定 4
+#   no_aug_epoch       : 官方固定 12
+#   aug_stop_epoch     = epoches - no_aug_epoch
+#   stage_middle_epoch = flat_epoch ≈ 4 + (epoches - no_aug_epoch) / 2   (官方 S = 64)
+# 例：epoches=200 → no_aug_epoch=12, aug_stop_epoch=188, stage_middle_epoch=98
+stage_start_epoch: &stage_start_epoch 4
+stage_middle_epoch: &stage_middle_epoch 64
+aug_stop_epoch: &aug_stop_epoch 120
+flat_epoch: *stage_middle_epoch
+no_aug_epoch: 12
+lr_gamma: 0.5
+
+# warmup 必须按数据集规模缩放，取总 iter 的 3% ~ 5%。
+#   总 iter = ceil(train_size / train_total_batch_size) * epoches
+#   NEU-DET  1800 张 / bs32 =  57 it/ep × 132 =  7524 → warmup_iter ≈ 300
+#   GC10-DET 2300 张 / bs32 =  72 it/ep × 132 =  9504 → warmup_iter ≈ 400
+#   涂饰木  13400 张 / bs32 = 419 it/ep × 132 = 55308 → warmup_iter ≈ 2000
+# ../base/deim.yml 里的默认值 2000 是给 COCO 11.7 万张用的，小数据集上会吃掉大量预算。
+warmup_iter: 300
+
+# 训练和验证输入尺寸。评估尺寸必须和 val 的 Resize 严格一致。
+train_resize_size: &train_resize_size [640, 640]
+eval_resize_size: &eval_resize_size [640, 640]
+eval_spatial_size: *eval_resize_size
+
+# collate 阶段使用的基础尺寸；多尺度实现使用单个整数，建议方形输入。
+train_base_size: &train_base_size 640
+# Mosaic 内部先把单张图缩放到该尺寸再拼 2x2；通常取 train_base_size / 2。
+mosaic_output_size: &mosaic_output_size 320
+
+# 多尺度训练开关：
+#   关闭：multiscale_repeat: ~
+#   开启：正整数，表示基础尺寸在尺度列表中重复的次数（官方 S = 20）
+multiscale_repeat: &multiscale_repeat 20
+
+# 全局 batch size；多卡训练时单卡 batch_size = total_batch_size / GPU 数量。
+# 官方 S 配方对应 total_batch_size = 32。
+# ！若显存不足下调此值，请把下面 optimizer 的 lr 与 backbone lr 按同比例线性下调。
+train_total_batch_size: &train_total_batch_size 32
+val_total_batch_size: &val_total_batch_size 32
+
+# 数据路径，按实际机器位置修改。
+train_img_folder: &train_img_folder /path/to/dataset/images/train
+train_ann_file: &train_ann_file /path/to/dataset/annotations/instances_train.json
+val_img_folder: &val_img_folder /path/to/dataset/images/val
+val_ann_file: &val_ann_file /path/to/dataset/annotations/instances_val.json
+# ========================================================
+
+
+# -------------------- 模型结构：官方 DEIM-S --------------------
+DEIM:
+  backbone: HGNetv2
+
+HGNetv2:
+  name: "B0"
+  return_idx: [1, 2, 3]
+  use_lab: True
+  # DEIM 的 "Unfreezing BN" 组件：主干不冻结、BN 参与训练。
+  # 注意 deim_hgnetv2_l_wood.yml 里写的是 freeze_at: 0 / freeze_norm: True
+  # （沿用了 D-FINE 的设置），那等于关掉了 DEIM 自己的一个组件，这里改回官方值。
+  freeze_at: -1
+  freeze_norm: False
+
+HybridEncoder:
+  in_channels: [256, 512, 1024]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.
+  enc_act: "gelu"
+  expansion: 0.5
+  depth_mult: 0.34
+  act: "silu"
+
+DFINETransformer:
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 3
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 100
+  reg_max: 32
+  reg_scale: 4
+  num_points: [3, 6, 3]
+  activation: silu
+  mlp_act: silu
+
+
+# -------------------- 数据管线 --------------------
+train_dataloader:
+  total_batch_size: *train_total_batch_size
+  dataset:
+    img_folder: *train_img_folder
+    ann_file: *train_ann_file
+    transforms:
+      ops:
+        - {
+            type: Mosaic,
+            output_size: *mosaic_output_size,
+            rotation_range: 10,
+            translation_range: [0.1, 0.1],
+            scaling_range: [0.5, 1.5],
+            probability: 1.0,
+            fill_value: 0,
+            use_cache: False,
+            max_cached_images: 50,
+            random_pop: True,
+          }
+        - { type: RandomPhotometricDistort, p: 0.5 }
+        - { type: RandomZoomOut, fill: 0 }
+        - { type: RandomIoUCrop, p: 0.8 }
+        - { type: SanitizeBoundingBoxes, min_size: 1 }
+        - { type: RandomHorizontalFlip }
+        - { type: Resize, size: *train_resize_size }
+        - { type: SanitizeBoundingBoxes, min_size: 1 }
+        - { type: ConvertPILImage, dtype: "float32", scale: True }
+        - { type: ConvertBoxes, fmt: "cxcywh", normalize: True }
+      policy:
+        name: stop_epoch
+        # [4, 64, 120]：第 4 epoch 后进入强增强，第 64 epoch 后降低强增强，第 120 epoch 后关闭。
+        epoch: [*stage_start_epoch, *stage_middle_epoch, *aug_stop_epoch]
+        ops:
+          [
+            "Mosaic",
+            "RandomPhotometricDistort",
+            "RandomZoomOut",
+            "RandomIoUCrop",
+          ]
+      mosaic_prob: 0.5
+  collate_fn:
+    type: BatchImageCollateFunction
+    base_size: *train_base_size
+    base_size_repeat: *multiscale_repeat
+    mixup_prob: 0.5
+    mixup_epochs: [*stage_start_epoch, *stage_middle_epoch]
+    stop_epoch: *aug_stop_epoch
+    ema_restart_decay: 0.9999
+
+val_dataloader:
+  total_batch_size: *val_total_batch_size
+  dataset:
+    img_folder: *val_img_folder
+    ann_file: *val_ann_file
+    transforms:
+      ops:
+        - { type: Resize, size: *eval_resize_size }
+        - { type: ConvertPILImage, dtype: "float32", scale: True }
+
+
+# -------------------- 优化与 EMA：官方 DEIM-S 配方 --------------------
+# S 的 backbone 学习率是主 lr 的 1/2（不是 L 的 1/20）。
+# 把 L 的 1/20 倍率套到 B0 主干上会导致严重欠拟合。
+optimizer:
+  type: AdamW
+  params: 
+    - 
+      params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.0002
+    - 
+      params: '^(?=.*(?:norm|bn)).*$'     # except bias
+      weight_decay: 0.
+
+  lr: 0.0004
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+  lr: 0.0004
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+use_amp: True
+use_ema: True
+ema:
+  type: ModelEMA
+  decay: 0.9999
+  # 与 warmup_iter 同步缩放，取其一半即可。默认 1000 同样是 COCO 的量。
+  warmups: 150
+  start: 0
+
+clip_max_norm: 0.1
+checkpoint_freq: 8
+
+
+# -------------------- 损失：DEIM 默认（MAL + FGL + DDF）--------------------
+DEIMCriterion:
+  weight_dict: { loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5 }
+  losses: ["mal", "boxes", "local"]
+  gamma: 1.5
+  reg_max: 32
+  matcher:
+    type: HungarianMatcher
+    weight_dict: { cost_class: 2, cost_bbox: 5, cost_giou: 2 }
+    alpha: 0.25
+    gamma: 2.0

@@ -30,6 +30,7 @@ class BaseConfig(object):
         self._model :nn.Module = None
         self._postprocessor :nn.Module = None
         self._criterion :nn.Module = None
+        self._distiller :nn.Module = None
         self._optimizer :Optimizer = None
         self._lr_scheduler :LRScheduler = None
         self._lr_warmup_scheduler: LRScheduler = None
@@ -106,6 +107,15 @@ class BaseConfig(object):
     def criterion(self, m):
         assert isinstance(m, nn.Module), f'{type(m)} != nn.Module, please check your model class'
         self._criterion = m
+
+    @property
+    def distiller(self, ) -> nn.Module:
+        return self._distiller
+
+    @distiller.setter
+    def distiller(self, m):
+        assert isinstance(m, nn.Module), f'{type(m)} != nn.Module'
+        self._distiller = m
 
     @property
     def optimizer(self, ) -> Optimizer:

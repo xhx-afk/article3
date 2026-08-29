@@ -8,6 +8,7 @@ import atexit
 
 from ..misc import dist_utils
 from ..core import BaseConfig
+from ..deim.distill import EncoderFeatureHook
 
 
 def to(m: nn.Module, device: str):
@@ -80,6 +81,32 @@ class BaseSolver(object):
     def train(self):
         self._setup()
         self.optimizer = self.cfg.optimizer
+
+        # ---------- 训练期蒸馏（创新点 1）。推理路径完全不涉及 ----------
+        # eval() 路径不建 distiller；checkpoint 里多出的 distiller 键
+        # 在 --test-only 时会被自动忽略（self.__dict__ 里没有该成员）。
+        self.distiller = None
+        self.feat_hook = None
+        if 'distiller' in self.cfg.yaml_cfg:
+            distiller = self.cfg.distiller.to(self.device)
+            params = [p for p in distiller.parameters() if p.requires_grad]
+            if params:
+                base_lr = self.optimizer.param_groups[0]['lr']
+                lr = distiller.aligner_lr if distiller.aligner_lr is not None else base_lr
+                # initial_lr 必须显式给：FlatCosineLRScheduler 直接读这个键
+                self.optimizer.add_param_group(
+                    {'params': params, 'lr': lr, 'initial_lr': lr, 'weight_decay': 0.})
+            # aligner 里没有 BN，sync_bn=False；只为选中层建 aligner，无未用参数
+            self.distiller = dist_utils.warp_model(
+                distiller, sync_bn=False, find_unused_parameters=False)
+            self.feat_hook = EncoderFeatureHook(dist_utils.de_parallel(self.model).encoder)
+            n = sum(p.numel() for p in params)
+            print(f'     ### Distillation ON | layers={distiller.layers} '
+                  f'| teacher_dim={distiller.teacher.embed_dim} | aligner params={n} ###')
+        # ---------------------------------------------------------------
+
+        # 注意：必须夹在 optimizer 与 lr_scheduler 之间。晚于此处加 param group，
+        # initial_lr 不会被写入，调度器会直接 KeyError。
         self.lr_scheduler = self.cfg.lr_scheduler
         self.lr_warmup_scheduler = self.cfg.lr_warmup_scheduler
 

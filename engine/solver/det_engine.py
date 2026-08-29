@@ -37,6 +37,11 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     scaler :GradScaler = kwargs.get('scaler', None)
     lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
 
+    distiller = kwargs.get('distiller', None)
+    feat_hook = kwargs.get('feat_hook', None)
+    if feat_hook is not None:
+        feat_hook.enabled = True
+
     cur_iters = epoch * len(data_loader)
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
@@ -63,6 +68,10 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
+                if distiller is not None:
+                    # 教师前向在 distiller 内部自开 fp16 autocast；
+                    # 这里关 autocast 保证蒸馏损失在 fp32 下计算（现状 F4）
+                    loss_dict.update(distiller(samples, feat_hook.pop(), epoch=epoch))
 
             loss = sum(loss_dict.values())
             scaler.scale(loss).backward()
@@ -78,6 +87,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         else:
             outputs = model(samples, targets=targets)
             loss_dict = criterion(outputs, targets, **metas)
+            if distiller is not None:
+                loss_dict.update(distiller(samples, feat_hook.pop(), epoch=epoch))
 
             loss : torch.Tensor = sum(loss_dict.values())
             optimizer.zero_grad()
@@ -115,6 +126,9 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+
+    if feat_hook is not None:
+        feat_hook.enabled = False
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

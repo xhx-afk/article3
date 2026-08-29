@@ -51,6 +51,12 @@ class YAMLConfig(BaseConfig):
         return super().criterion
 
     @property
+    def distiller(self, ) -> torch.nn.Module:
+        if self._distiller is None and 'distiller' in self.yaml_cfg:
+            self._distiller = create('distiller', self.global_cfg)
+        return super().distiller
+
+    @property
     def optimizer(self, ) -> optim.Optimizer:
         if self._optimizer is None and 'optimizer' in self.yaml_cfg:
             params = self.get_optim_params(self.yaml_cfg['optimizer'], self.model)

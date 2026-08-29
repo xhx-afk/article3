@@ -90,7 +90,10 @@ class DetSolver(BaseSolver):
                 ema=self.ema, 
                 scaler=self.scaler, 
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
-                writer=self.writer
+                writer=self.writer,
+                # --test-only / eval() 路径不设这两个成员，用 getattr 兜底
+                distiller=getattr(self, 'distiller', None),
+                feat_hook=getattr(self, 'feat_hook', None),
             )
 
             if not self.self_lr_scheduler:  # update by epoch 

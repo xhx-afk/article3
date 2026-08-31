@@ -84,13 +84,21 @@ def main():
     print('\n[S2][S3] student encoder outputs & P4 exact alignment')
     was_training = model.training
     model.eval()                     # 见 S8 注释：eval 避开 denoising 组对 targets 的要求
+    # DEIM 的 HybridEncoder 在 eval 模式下使用 eval_spatial_size(=640) 预生成的
+    # 固定 pos_embed，喂非 640 尺寸会形状不匹配；train 模式下按输入尺寸动态构建。
+    # 这里只把 encoder 单独切回 train（其余部分保持 eval）：encoder 内只有
+    # LayerNorm 和 dropout(=0.0)，不影响 S8 的梯度连通性验证。
+    enc = dist_utils.de_parallel(model).encoder
+    enc.train()
     p4_idx = min(range(len(distiller.student_strides)),
                  key=lambda i: abs(distiller.student_strides[i] - teacher.patch_size))
     for size in (480, 640, 800):
         imgs = torch.rand(2, 3, size, size, device=device)
-        hook.enabled = True
-        _ = model(imgs)
-        feats = hook.pop()
+        # 只跑 backbone→encoder：eval 模式下 decoder 的 valid_mask/anchor 按
+        # eval_spatial_size(=640) 预生成，非 640 尺寸的全模型前向会形状不匹配；
+        # 而蒸馏只需要编码器输出，手动调用与真实训练的编码器输出完全一致。
+        m = dist_utils.de_parallel(model)
+        feats = m.encoder(m.backbone(imgs))
         for i, f in enumerate(feats):
             s = size // distiller.student_strides[i]
             assert tuple(f.shape) == (2, distiller.student_channels[i], s, s), \
@@ -140,9 +148,12 @@ def main():
     # ---------- S7: 记录量级（供手册填写） ----------
     print('\n[S7] magnitude report')
     n_aligner = sum(p.numel() for p in distiller.parameters() if p.requires_grad)
-    n_teacher = sum(p.numel() for p in teacher.parameters())
+    # 教师内部模型未注册进 nn.Module（C2/C6 设计），parameters() 恒为空，
+    # 真实参数量要从 object.__setattr__ 存进去的 model 上取
+    n_teacher = sum(p.numel() for p in teacher.model.parameters())
     print(f'  aligner trainable params : {n_aligner} ({n_aligner / 1e6:.3f}M)')
-    print(f'  teacher params           : {n_teacher} ({n_teacher / 1e6:.1f}M), frozen')
+    print(f'  teacher params           : {n_teacher} ({n_teacher / 1e6:.1f}M), '
+          'frozen & excluded from all state_dict')
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_allocated()
@@ -161,7 +172,10 @@ def main():
     # get_contrastive_denoising_training_group(targets, ...)，targets=None 直接抛异常，
     # 报错信息还很难读。eval 只影响 BN/dropout，不关闭 autograd，
     # 梯度连通性照验；forward hook 在 eval 下同样触发。
+    # encoder 单独 train：与真实训练一致（动态 pos_embed），且避免 eval 固定
+    # pos_embed 把梯度验证限制在 640 尺寸。
     model.eval()
+    dist_utils.de_parallel(model).encoder.train()
     hook.enabled = True
     _ = model(imgs)
     out = distiller(imgs, hook.pop(), epoch=0)

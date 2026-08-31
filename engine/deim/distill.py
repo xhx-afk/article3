@@ -193,6 +193,7 @@ class FeatureDistiller(nn.Module):
         object.__setattr__(self, 'teacher', teacher)   # 同样不注册为子模块
 
         self.layers = list(layers)
+        self.student_channels = list(student_channels)
         self.student_strides = list(student_strides)
         self.loss_type = loss_type
         self.loss_weight = float(loss_weight)

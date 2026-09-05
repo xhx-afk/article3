@@ -441,6 +441,7 @@ class HGNetv2(nn.Module):
                  freeze_at=0,
                  freeze_norm=True,
                  pretrained=True,
+                 pretrained_strict=True,
                  local_model_dir='weight/hgnetv2/'):
         super().__init__()
         self.use_lab = use_lab
@@ -506,15 +507,28 @@ class HGNetv2(nn.Module):
 
                     print(f"Loaded stage1 {name} HGNetV2 from URL.")
 
-                self.load_state_dict(state)
+                incompat = self.load_state_dict(state, strict=pretrained_strict)
+                if not pretrained_strict:
+                    missing = list(incompat.missing_keys)
+                    unexpected = list(incompat.unexpected_keys)
+                    print(f"[HGNetv2] non-strict load: missing={len(missing)} unexpected={len(unexpected)}")
+                    print(f"[HGNetv2]   missing  (first 10): {missing[:10]}")
+                    print(f"[HGNetv2]   unexpected (first 10): {unexpected[:10]}")
 
             except (Exception, KeyboardInterrupt) as e:
-                if torch.distributed.get_rank() == 0:
+                dist_ready = torch.distributed.is_available() and torch.distributed.is_initialized()
+                if (not dist_ready) or torch.distributed.get_rank() == 0:
                     print(f"{str(e)}")
                     logging.error(RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET)
                     logging.error(GREEN + "Please check your network connection. Or download the model manually from " \
                                 + RESET + f"{download_url}" + GREEN + " to " + RESET + f"{local_model_dir}." + RESET)
-                exit()
+                    logging.error(GREEN + "if you replaced backbone submodules, set HGNetv2.pretrained_strict=False" + RESET)
+                raise RuntimeError(
+                    f"Failed to load pretrained HGNetV2 weights ({e}). "
+                    "Please check your network connection, or download the model manually from "
+                    f"{download_url} to {local_model_dir}. "
+                    "If you replaced backbone submodules, set HGNetv2.pretrained_strict=False."
+                ) from e
 
 
 

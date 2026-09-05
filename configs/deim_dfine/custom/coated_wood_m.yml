@@ -1,0 +1,53 @@
+# 本文件由 tools/make_dataset_config.py 自动生成，请勿手改。
+# 需要改动请改生成参数后重新生成，否则四个增强锚点很容易改漏。
+#
+# 数据集 coated_wood | 模型 DEIM-M | 类别 4
+# 训练集 9160 张 | batch 32 | 287 it/epoch
+# epoches 102 → 总 29274 iter | warmup 1150 (3.9%)
+#
+# 训练：
+#   torchrun --master_port=7777 --nproc_per_node=2 train.py \
+#     -c configs/deim_dfine/custom/coated_wood_m.yml \
+#     -t /path/to/deim_dfine_hgnetv2_m_coco.pth --use-amp --seed 0
+
+__include__: ["../deim_hgnetv2_m_custom.yml"]
+
+output_dir: ./deim_outputs/coated_wood/deim_m_640_e102_seed0
+num_classes: 4
+remap_mscoco_category: False
+
+# ---- 训练轮数与调度：由 epoches 推导，四处已保持一致 ----
+epoches: 102
+flat_epoch: 49
+no_aug_epoch: 12
+lr_gamma: 0.5
+warmup_iter: 1150
+
+ema:
+  warmups: 575
+
+# ---- 数据与增强调度 ----
+train_dataloader:
+  total_batch_size: 32
+  dataset:
+    img_folder: ./datasets\Water-Based-Coated-Wood/images/train
+    ann_file: ./datasets\Water-Based-Coated-Wood/annotations/instances_train.json
+    transforms:
+      policy:
+        name: stop_epoch
+        epoch: [4, 49, 90]
+        ops: ["Mosaic", "RandomPhotometricDistort", "RandomZoomOut", "RandomIoUCrop"]
+      mosaic_prob: 0.5
+  collate_fn:
+    type: BatchImageCollateFunction
+    base_size: 640
+    mixup_prob: 0.5
+    mixup_epochs: [4, 49]
+    stop_epoch: 90
+    ema_restart_decay: 0.9999
+
+val_dataloader:
+  total_batch_size: 32
+  dataset:
+    img_folder: ./datasets\Water-Based-Coated-Wood/images/val
+    ann_file: ./datasets\Water-Based-Coated-Wood/annotations/instances_val.json

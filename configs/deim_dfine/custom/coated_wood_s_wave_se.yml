@@ -1,0 +1,11 @@
+# A3 对照：门控改读子带【均值】而不是【能量占比】——证明本文门控与普通 SE
+# 的分界线在"读的是能量占比"。
+__include__: ["./coated_wood_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood/A3_wave_gate_se_s_640_e132_seed0
+
+HGNetv2:
+  downsample_type: haar_se
+  downsample_stages: [2, 3, 4]
+  gate_reduction: 4
+  pretrained_strict: False

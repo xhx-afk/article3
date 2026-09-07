@@ -1,0 +1,10 @@
+# A2-full 消融：1x1 投影改为稠密（4C->C，参数 4C^2），其余同 A2。
+__include__: ["./coated_wood_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood/A2full_wave_gate_full_s_640_e132_seed0
+
+HGNetv2:
+  downsample_type: haar_gate_full
+  downsample_stages: [2, 3, 4]
+  gate_reduction: 4
+  pretrained_strict: False

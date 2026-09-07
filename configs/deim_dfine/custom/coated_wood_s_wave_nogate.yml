@@ -1,0 +1,10 @@
+# A1：纯小波下采样（无门控）——回答"小波域本身带来多少"。
+__include__: ["./coated_wood_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood/A1_wave_nogate_s_640_e132_seed0
+
+HGNetv2:
+  downsample_type: haar
+  downsample_stages: [2, 3, 4]
+  # 新模块的键不在 ImageNet 权重里
+  pretrained_strict: False

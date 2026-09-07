@@ -39,6 +39,7 @@ from common import (  # noqa: E402
     APResult, coco_ap, group_by_source, index_gt, load_coco,
     match_image_category, norm_id, parse_name,
 )
+from common import _gt_ignore_flag  # noqa: E402
 
 CODES = ['ODC', 'LDC', 'DDC', 'GDC', 'PDC']
 
@@ -56,9 +57,11 @@ class Precomputed:
         self.scores = {}        # cat -> (N,) float64, descending (stable)
         self.units = {}         # cat -> (N,) int32 unit index
         self.tp = {}            # cat -> (N, 10) uint8
-        self.tp_idx = {}        # cat -> [10 arrays of TP positions]
-        self.npig = None        # (n_units, n_cats) GT counts
+        self.dt_ig = {}         # cat -> (N, 10) uint8 (ignore flag of match)
+        self.tp_idx = {}        # cat -> [10 arrays of TP&~ig positions]
+        self.npig = None        # (n_units, n_cats) NON-ignored GT counts
         self.unit_list = []
+        self.has_ignore = False # any dt_ig set? selects fast/slow AP path
 
 
 def _unit_of_image(images, unit_kind):
@@ -79,7 +82,14 @@ def _unit_of_image(images, unit_kind):
     return mapping
 
 
-def build_precomputed(gt_index, dt, images, unit_kind):
+def build_precomputed(gt_index, dt, images, unit_kind, gt_subset=None):
+    """Precompute TP/ignore flags once; bootstrap replicates only re-accumulate.
+
+    gt_subset: optional {annotation_id} set. GTs outside the set are IGNORED
+    (they still participate in matching and consume detections, exactly as
+    pycocotools does) instead of deleted -- deleting them would turn correct
+    detections into FPs and collapse stratified AP.
+    """
     pc = Precomputed()
     unit_of = _unit_of_image(images, unit_kind)
     pc.unit_list = sorted(set(unit_of.values()))
@@ -95,49 +105,62 @@ def build_precomputed(gt_index, dt, images, unit_kind):
         if iid not in unit_of:
             continue
         for ann in anns:
-            if int(ann.get('iscrowd', 0)) == 1 or int(ann.get('ignore', 0)) == 1:
-                continue
-            gt_by_ic.setdefault((iid, int(ann['category_id'])), []).append(ann)
+            # ALL anns kept (crowd/out-of-subset stay as ignore targets)
+            gt_by_ic.setdefault((iid, int(ann['category_id'])), []).append(
+                (ann, _gt_ignore_flag(ann, gt_subset)))
 
     cats = sorted({c for (_, c) in gt_by_ic} | {c for (_, c) in dt_by_ic})
     pc.cats = cats
     cat_pos = {c: i for i, c in enumerate(cats)}
 
     pc.npig = np.zeros((n_units, len(cats)), dtype=np.float64)
-    for (iid, c), anns in gt_by_ic.items():
-        pc.npig[unit_index[unit_of[iid]], cat_pos[c]] += len(anns)
+    for (iid, c), entries in gt_by_ic.items():
+        pc.npig[unit_index[unit_of[iid]], cat_pos[c]] += sum(
+            1 for (_, ig) in entries if ig == 0)
 
     for c in cats:
-        rows_score, rows_unit, rows_tp = [], [], []
+        rows_score, rows_unit, rows_tp, rows_ig = [], [], [], []
         for iid in sorted(images):
             dets = dt_by_ic.get((iid, c), [])
-            gtb = [a['bbox'] for a in gt_by_ic.get((iid, c), [])]
+            entries = gt_by_ic.get((iid, c), [])
+            gtb = [a['bbox'] for (a, _) in entries]
+            gti = [ig for (_, ig) in entries]
+            gtc = [int(a.get('iscrowd', 0)) for (a, _) in entries]
             dets = sorted(dets, key=lambda d: -float(d['score']))
             boxes = [d['bbox'] for d in dets]
             scores = [float(d['score']) for d in dets]
-            tp = match_image_category(gtb, boxes, iou_thrs=IOU_THRS,
-                                      max_dets=MAX_DETS)
+            tp, dt_ig = match_image_category(gtb, boxes, gt_ignore=gti,
+                                             iou_thrs=IOU_THRS,
+                                             max_dets=MAX_DETS,
+                                             gt_iscrowd=gtc)
             n = tp.shape[0]
             if n == 0:
                 continue
             rows_score.append(np.asarray(scores[:n], dtype=np.float64))
             rows_unit.append(np.full(n, unit_index[unit_of[iid]], dtype=np.int32))
             rows_tp.append(tp.astype(np.uint8))
+            rows_ig.append(dt_ig.astype(np.uint8))
         if rows_score:
             scores = np.concatenate(rows_score)
             units = np.concatenate(rows_unit)
             tp = np.concatenate(rows_tp, axis=0)
+            dt_ig = np.concatenate(rows_ig, axis=0)
         else:
             scores = np.zeros((0,), dtype=np.float64)
             units = np.zeros((0,), dtype=np.int32)
             tp = np.zeros((0, len(IOU_THRS)), dtype=np.uint8)
+            dt_ig = np.zeros((0, len(IOU_THRS)), dtype=np.uint8)
         # one single stable global sort by descending score (COCO semantics)
         order = np.argsort(-scores, kind='mergesort')
-        scores, units, tp = scores[order], units[order], tp[order]
+        scores, units, tp, dt_ig = scores[order], units[order], tp[order], dt_ig[order]
         pc.scores[c] = scores
         pc.units[c] = units
         pc.tp[c] = tp
-        pc.tp_idx[c] = [np.where(tp[:, t] == 1)[0] for t in range(tp.shape[1])]
+        pc.dt_ig[c] = dt_ig
+        if dt_ig.any():
+            pc.has_ignore = True
+        pc.tp_idx[c] = [np.where((tp[:, t] == 1) & (dt_ig[:, t] == 0))[0]
+                        for t in range(tp.shape[1])]
     return pc
 
 
@@ -147,36 +170,65 @@ def weighted_ap(pc, weights):
     Equivalent to replicating every unit w_s times: cumsum(w*tp) over the
     fixed score-sorted order equals the cumsum of the replicated detection
     list (replicas of equal-score dets are adjacent under stable sort).
+
+    Detections matched to IGNORED GTs (dt_ig) count in NEITHER TP nor FP
+    (COCO accumulate semantics); npig counts only non-ignored GTs.
     """
     sum_thr = np.zeros(len(IOU_THRS), dtype=np.float64)
     ap50s, ap75s = [], []
     for ci, c in enumerate(pc.cats):
         npig_c = float(weights @ pc.npig[:, ci])
         if npig_c <= 0:
-            continue  # category without GT in this resample -> excluded
+            continue  # category without non-ignored GT in this resample -> excluded
         tp = pc.tp[c]
         cat_thr = np.zeros(len(IOU_THRS), dtype=np.float64)
         if tp.shape[0]:
             w_cat = weights[pc.units[c]].astype(np.float64)
-            tot_cum = np.cumsum(w_cat)
-            for t in range(len(IOU_THRS)):
-                idx = pc.tp_idx[c][t]
-                if idx.size == 0:
-                    continue  # no TP at this IoU -> all recall points give 0
-                tp_cum = np.cumsum(w_cat[idx])
-                fp_cum = tot_cum[idx] - tp_cum
-                rec_tp = tp_cum / npig_c
-                # guard zero-weight TP positions (their unit was not drawn):
-                # 0/0 would produce nan and poison the suffix-max below
-                prec = np.where(tp_cum > 0, tp_cum / (tp_cum + fp_cum), 0.0)
-                # suffix-max == monotone non-increasing fill from the tail; only
-                # TP positions can carry the running max (FPs only lower it)
-                prec = np.maximum.accumulate(prec[::-1])[::-1]
-                pi = np.searchsorted(rec_tp, REC_THRS, side='left')
-                vals = np.zeros(len(REC_THRS), dtype=np.float64)
-                ok = pi < idx.size
-                vals[ok] = prec[pi[ok]]
-                cat_thr[t] = vals.mean()
+            if pc.has_ignore:
+                # slow path (--gt-subset mode only): separate cumsums so that
+                # ignored dets drop out of BOTH the TP and the FP stream
+                is_tp = (tp == 1) & (pc.dt_ig[c] == 0)
+                is_fp = (tp == 0) & (pc.dt_ig[c] == 0)
+                tp_cum_all = np.cumsum(w_cat[:, None] * is_tp, axis=0)
+                fp_cum_all = np.cumsum(w_cat[:, None] * is_fp, axis=0)
+                rec_all = tp_cum_all / npig_c
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    prec_all = np.where(tp_cum_all + fp_cum_all > 0,
+                                        tp_cum_all / (tp_cum_all + fp_cum_all), 0.0)
+                for t in range(len(IOU_THRS)):
+                    idx = pc.tp_idx[c][t]
+                    if idx.size == 0:
+                        continue
+                    prec = prec_all[:, t].copy()
+                    # suffix-max == monotone non-increasing fill from the tail
+                    prec = np.maximum.accumulate(prec[::-1])[::-1]
+                    rec_tp = rec_all[idx, t]     # recall AT the TP positions
+                    prec_tp = prec[idx]          # precision AT the TP positions
+                    pi = np.searchsorted(rec_tp, REC_THRS, side='left')
+                    vals = np.zeros(len(REC_THRS), dtype=np.float64)
+                    ok = pi < idx.size
+                    vals[ok] = prec_tp[pi[ok]]
+                    cat_thr[t] = vals.mean()
+            else:
+                tot_cum = np.cumsum(w_cat)
+                for t in range(len(IOU_THRS)):
+                    idx = pc.tp_idx[c][t]
+                    if idx.size == 0:
+                        continue  # no TP at this IoU -> all recall points give 0
+                    tp_cum = np.cumsum(w_cat[idx])
+                    fp_cum = tot_cum[idx] - tp_cum
+                    rec_tp = tp_cum / npig_c
+                    # guard zero-weight TP positions (their unit was not drawn):
+                    # 0/0 would produce nan and poison the suffix-max below
+                    prec = np.where(tp_cum > 0, tp_cum / (tp_cum + fp_cum), 0.0)
+                    # suffix-max == monotone non-increasing fill from the tail; only
+                    # TP positions can carry the running max (FPs only lower it)
+                    prec = np.maximum.accumulate(prec[::-1])[::-1]
+                    pi = np.searchsorted(rec_tp, REC_THRS, side='left')
+                    vals = np.zeros(len(REC_THRS), dtype=np.float64)
+                    ok = pi < idx.size
+                    vals[ok] = prec[pi[ok]]
+                    cat_thr[t] = vals.mean()
         sum_thr += cat_thr
         ap50s.append(cat_thr[0])
         ap75s.append(cat_thr[5])
@@ -282,6 +334,54 @@ def run(args):
         'AP': res.AP, 'AP50': res.AP50, 'AP75': res.AP75,
         'max_dets': MAX_DETS,
     }
+
+    # stratified AP over instance groups (from degradation_paired --export-groups).
+    # Out-of-group GTs are IGNORED (not deleted) -- see common.coco_ap.
+    if args.gt_subset:
+        with open(args.gt_subset, 'r', encoding='utf-8') as f:
+            gs = json.load(f)
+        groups = gs.get('groups') or {}
+        if not groups:
+            sys.exit(f'[effective_n] --gt-subset file has no groups: {args.gt_subset}')
+        gt_b = images_b = dt_b = None
+        if args.pred_b:
+            gt_b, images_b, dt_b = _load_pair(args.ann, args.pred_b)
+        unit_kind = 'image' if args.by_image else 'source'
+        layers = {}
+        for gname in sorted(groups):
+            ids = {int(a) for a in groups[gname]}
+            if not ids:
+                sys.exit(f'[effective_n] gt-subset group {gname!r} is empty')
+            r_a = coco_ap(gt_index, dt, gt_subset=ids)
+            entry = {'n_gt': len(ids),
+                     'AP_A': r_a.AP, 'AP50_A': r_a.AP50, 'AP75_A': r_a.AP75}
+            line = f'[gt-subset] {gname}: n_gt={len(ids)} AP={r_a.AP:.6f}'
+            if args.pred_b:
+                r_b = coco_ap(gt_b, dt_b, gt_subset=ids)
+                entry.update(AP_B=r_b.AP, AP50_B=r_b.AP50, AP75_B=r_b.AP75)
+                line += f' AP_B={r_b.AP:.6f}'
+                if args.by_source or args.by_image:
+                    pc_a = build_precomputed(gt_index, dt, images, unit_kind,
+                                             gt_subset=ids)
+                    pc_b = build_precomputed(gt_b, dt_b, images_b, unit_kind,
+                                             gt_subset=ids)
+                    if pc_a.unit_list != pc_b.unit_list:
+                        sys.exit('[effective_n] paired mode requires the same ann sources')
+                    diff = bootstrap_paired(pc_a, pc_b, args.bootstrap, args.seed)
+                    s = summarize(diff)
+                    s['ci_includes_zero'] = bool(s['p2.5'] <= 0.0 <= s['p97.5'])
+                    entry['paired_delta'] = s
+                    line += (f' dAP={s["mean"]:.6f} '
+                             f'CI=[{s["p2.5"]:.6f}, {s["p97.5"]:.6f}]'
+                             + (' CI含0' if s['ci_includes_zero'] else ' CI不含0'))
+            layers[gname] = entry
+            print(line)
+        results['gt_subset'] = {'file': args.gt_subset, 'name': gs.get('name'),
+                                'unit': unit_kind, 'layers': layers}
+        if args.ap_only:
+            if args.out:
+                _dump(args.out, results)
+            return
 
     if args.by_code:
         code_ap = {}
@@ -574,6 +674,144 @@ def self_test():
           paired is not None and paired['mean'] == 0.0 and paired['sd'] == 0.0,
           str(paired))
 
+    # ---------- P5: ignore semantics / stratified AP (R1-R6) ----------
+    # R1. no-ignore regression: the pre-patch values are pinned exactly
+    gt = _toy_gt(None, 10)
+    dt = [{'image_id': i, 'category_id': 1, 'bbox': [0, 0, 100, 100],
+           'score': 1.0} for i in range(10)]
+    r = coco_ap(gt, dt)
+    check('R1 no-ignore regression (perfect -> 1.0/1.0/1.0)',
+          r.AP == 1.0 and r.AP50 == 1.0 and r.AP75 == 1.0,
+          f'{(r.AP, r.AP50, r.AP75)}')
+    gt = _toy_gt(None, 10, box=(0, 0, 162, 162))
+    dt = [{'image_id': i, 'category_id': 1, 'bbox': [38, 0, 162, 162],
+           'score': 0.9} for i in range(10)]
+    r = coco_ap(gt, dt)
+    check('R1 no-ignore regression (IoU=0.62 -> 0.30/1.0/0.0)',
+          r.AP50 == 1.0 and r.AP75 == 0.0 and abs(r.AP - 0.30) < 1e-12,
+          f'{(r.AP, r.AP50, r.AP75)}')
+
+    # R2. all GTs in the subset -> stratified AP == full AP (bit-exact)
+    gt = _toy_gt(None, 10)
+    dt = [{'image_id': i, 'category_id': 1, 'bbox': [0, 0, 100, 100],
+           'score': 0.5 + 0.01 * (i % 3)} for i in range(10)]
+    full = coco_ap(gt, dt)
+    strat = coco_ap(gt, dt,
+                    gt_subset={a['id'] for v in gt.values() for a in v})
+    check('R2 full subset -> bit-exact AP',
+          (strat.AP, strat.AP50, strat.AP75) == (full.AP, full.AP50, full.AP75),
+          f'{(strat.AP, strat.AP50, strat.AP75)} vs {(full.AP, full.AP50, full.AP75)}')
+
+    # R3. THE regression case for the old delete-semantics bug: an in-subset
+    #     GT and an ignored GT, each with a perfect detection, and the ignored
+    #     one has the HIGHER score. Old code deleted the ignored GT -> its
+    #     detection became an FP at the top of the score order -> AP == 0.5.
+    #     Correct COCO semantics: it is ignored (neither TP nor FP) -> AP == 1.0.
+    gt = {0: [{'id': 1, 'image_id': 0, 'category_id': 1,
+               'bbox': [0, 0, 100, 100], 'area': 10000, 'iscrowd': 0}],
+          1: [{'id': 2, 'image_id': 1, 'category_id': 1,
+               'bbox': [0, 0, 100, 100], 'area': 10000, 'iscrowd': 0}]}
+    dt = [{'image_id': 1, 'category_id': 1, 'bbox': [0, 0, 100, 100],
+           'score': 0.95},
+          {'image_id': 0, 'category_id': 1, 'bbox': [0, 0, 100, 100],
+           'score': 0.9}]
+    r = coco_ap(gt, dt, gt_subset={1})
+    check('R3 detection on ignored GT is neither TP nor FP -> AP == 1.0',
+          r.AP == 1.0, f'{r.AP} (old buggy semantics gave 0.5)')
+
+    # R4. empty subset -> hard error, never a silent 0/nan
+    raised = False
+    try:
+        coco_ap(gt, dt, gt_subset=set())
+    except Exception:
+        raised = True
+    check('R4 empty subset raises', raised)
+
+    # R5. early-termination rule: the det overlaps the ignored GT MORE
+    #     (IoU 0.90 vs 0.714) but must stay matched to the in-subset GT.
+    #     Without the rule it degrades onto the ignored GT -> dt_ig=1 -> AP=0.
+    gt = {0: [{'id': 1, 'image_id': 0, 'category_id': 1,
+               'bbox': [0, 0, 100, 100], 'area': 10000, 'iscrowd': 0},
+              {'id': 2, 'image_id': 0, 'category_id': 1,
+               'bbox': [0, 0, 100, 126], 'area': 12600, 'iscrowd': 0}]}
+    dt = [{'image_id': 0, 'category_id': 1, 'bbox': [0, 0, 100, 140],
+           'score': 0.9}]
+    r = coco_ap(gt, dt, gt_subset={1})
+    # npig=1; det is TP at IoU 0.50..0.70 (5/10 thresholds) -> AP=0.5, AP50=1.0
+    check('R5 early termination keeps the non-ignored match',
+          abs(r.AP - 0.5) < 1e-12 and r.AP50 == 1.0, f'{(r.AP, r.AP50)}')
+
+    # R6. pycocotools cross-check WITH iscrowd GTs (crowd re-matchable, ignored
+    #     in accumulation)
+    try:
+        from pycocotools.coco import COCO
+        from pycocotools.cocoeval import COCOeval
+    except ImportError:
+        print('  [SKIP] pycocotools not installed (R6)')
+    else:
+        rng = np.random.default_rng(3)
+        n_img, cats = 20, 3
+        images = [{'id': i, 'width': 200, 'height': 200,
+                   'file_name': f'{i:06d}_ODC_0.jpg'} for i in range(n_img)]
+        anns, dt6 = [], []
+        aid = 1
+        for i in range(n_img):
+            for k in range(rng.integers(1, 5)):
+                c = int(rng.integers(1, cats + 1))
+                bx = float(rng.uniform(0, 150))
+                by = float(rng.uniform(0, 150))
+                bw = float(rng.uniform(10, 60))
+                bh = float(rng.uniform(10, 60))
+                crowd = int(rng.random() < 0.25)
+                anns.append({'id': aid, 'image_id': i, 'category_id': c,
+                             'bbox': [bx, by, bw, bh], 'area': bw * bh,
+                             'iscrowd': crowd})
+                px = float(np.clip(bx + rng.normal(0, 4), 0, 200))
+                py = float(np.clip(by + rng.normal(0, 4), 0, 200))
+                dt6.append({'image_id': i, 'category_id': c,
+                            'bbox': [px, py, bw, bh],
+                            'score': float(rng.random())})
+                aid += 1
+        toy = {'images': images, 'annotations': anns,
+               'categories': [{'id': c, 'name': str(c)}
+                              for c in range(1, cats + 1)]}
+        import tempfile, os
+        tmpdir = tempfile.mkdtemp(prefix='effn_r6_')
+        ann_path = os.path.join(tmpdir, 'toy.json')
+        with open(ann_path, 'w', encoding='utf-8') as f:
+            json.dump(toy, f)
+        coco_gt = COCO(ann_path)
+        coco_dt = coco_gt.loadRes(dt6)
+        ev = COCOeval(coco_gt, coco_dt, 'bbox')
+        ev.evaluate(); ev.accumulate(); ev.summarize()
+        gt_index, _, _ = index_gt(toy)
+        mine = coco_ap(gt_index, dt6)
+        diffs = [abs(mine.AP - ev.stats[0]), abs(mine.AP50 - ev.stats[1]),
+                 abs(mine.AP75 - ev.stats[2])]
+        check('R6 pycocotools cross-check with iscrowd < 1e-6',
+              max(diffs) < 1e-6, f'max diff {max(diffs):.2e}')
+
+    # R7. weighted_ap slow path (has_ignore) must equal coco_ap(gt_subset)
+    #     bit-exactly at all-ones weights -- locks the ignore-aware accumulation
+    gt7 = {0: [{'id': 1, 'image_id': 0, 'category_id': 1,
+                'bbox': [0, 0, 100, 100], 'area': 10000, 'iscrowd': 0}],
+           1: [{'id': 2, 'image_id': 1, 'category_id': 1,
+                'bbox': [0, 0, 100, 100], 'area': 10000, 'iscrowd': 0}]}
+    dt7 = [{'image_id': 1, 'category_id': 1, 'bbox': [0, 0, 100, 100],
+            'score': 0.95},
+           {'image_id': 0, 'category_id': 1, 'bbox': [0, 0, 100, 100],
+            'score': 0.9}]
+    r7 = coco_ap(gt7, dt7, gt_subset={1})
+    pc7 = build_precomputed(
+        gt7, dt7,
+        {0: {'file_name': '000000_ODC_0.jpg'},
+         1: {'file_name': '000001_ODC_1.jpg'}},
+        'source', gt_subset={1})
+    ap7 = weighted_ap(pc7, np.ones(len(pc7.unit_list), dtype=np.float64))
+    check('R7 ignore-aware weighted_ap == coco_ap(gt_subset) bit-exact',
+          ap7 == (r7.AP, r7.AP50, r7.AP75),
+          f'{ap7} vs {(r7.AP, r7.AP50, r7.AP75)}')
+
     if failures:
         print(f'SELF-TESTS FAILED: {failures}')
         return 1
@@ -587,6 +825,10 @@ def build_parser():
     ap.add_argument('--pred', default=None, help='pred json (method A)')
     ap.add_argument('--pred-b', default=None,
                     help='pred json (method B); enables paired ΔAP mode')
+    ap.add_argument('--gt-subset', default=None,
+                    help='groups json from degradation_paired --export-groups; '
+                         'computes per-group stratified AP (out-of-group GTs '
+                         'are ignored, never deleted)')
     ap.add_argument('--by-source', action='store_true',
                     help='bootstrap over original sources (correct)')
     ap.add_argument('--by-image', action='store_true',
@@ -621,3 +863,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

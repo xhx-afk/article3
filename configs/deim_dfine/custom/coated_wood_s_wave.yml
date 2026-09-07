@@ -1,0 +1,13 @@
+# A2 主线：stage2/3/4 的下采样替换为 Haar 小波下采样 + 子带能量门控。
+# 种子 1/2 用 -u output_dir=... 覆盖，训练配方（132e/bs32/调度）全部继承基线。
+__include__: ["./coated_wood_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood/A2_wave_gate_s_640_e132_seed0
+
+HGNetv2:
+  # 替换 stage2/3/4 的下采样为小波 + 子带能量门控
+  downsample_type: haar_gate
+  downsample_stages: [2, 3, 4]
+  gate_reduction: 4
+  # 必需：backbone 的 ImageNet 权重里没有新模块的键，strict 加载会 RuntimeError
+  pretrained_strict: False

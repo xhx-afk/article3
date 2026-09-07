@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 from .common import FrozenBatchNorm2d
+from .wavelet import HaarSubbandDownsample
 from ..core import register
 import logging
 
@@ -299,19 +300,39 @@ class HG_Stage(nn.Module):
             use_lab=False,
             agg='se',
             drop_path=0.,
+            downsample_type='conv',
+            gate_reduction=4,
     ):
         super().__init__()
         self.downsample = downsample
         if downsample:
-            self.downsample = ConvBNAct(
-                in_chs,
-                in_chs,
-                kernel_size=3,
-                stride=2,
-                groups=in_chs,
-                use_act=False,
-                use_lab=use_lab,
-            )
+            if downsample_type == 'conv':
+                self.downsample = ConvBNAct(
+                    in_chs,
+                    in_chs,
+                    kernel_size=3,
+                    stride=2,
+                    groups=in_chs,
+                    use_act=False,
+                    use_lab=use_lab,
+                )
+            elif downsample_type == 'haar':
+                self.downsample = HaarSubbandDownsample(
+                    in_chs, gate=False, mode='dw')
+            elif downsample_type == 'haar_gate':
+                self.downsample = HaarSubbandDownsample(
+                    in_chs, gate=True, mode='dw', reduction=gate_reduction)
+            elif downsample_type == 'haar_gate_full':
+                self.downsample = HaarSubbandDownsample(
+                    in_chs, gate=True, mode='full', reduction=gate_reduction)
+            elif downsample_type == 'haar_se':
+                self.downsample = HaarSubbandDownsample(
+                    in_chs, gate=True, mode='dw', reduction=gate_reduction,
+                    se_baseline=True)
+            else:
+                raise ValueError(
+                    f'unknown downsample_type {downsample_type!r}; expected '
+                    f"'conv' | 'haar' | 'haar_gate' | 'haar_gate_full' | 'haar_se'")
         else:
             self.downsample = nn.Identity()
 
@@ -442,7 +463,11 @@ class HGNetv2(nn.Module):
                  freeze_norm=True,
                  pretrained=True,
                  pretrained_strict=True,
-                 local_model_dir='weight/hgnetv2/'):
+                 local_model_dir='weight/hgnetv2/',
+                 downsample_type='conv',
+                 downsample_stages=(2, 3, 4),
+                 gate_reduction=4,
+                 reinit_downsample=False):
         super().__init__()
         self.use_lab = use_lab
         self.return_idx = return_idx
@@ -466,6 +491,8 @@ class HGNetv2(nn.Module):
         for i, k in enumerate(stage_config):
             in_channels, mid_channels, out_channels, block_num, downsample, light_block, kernel_size, layer_num = stage_config[
                 k]
+            # stage numbers are 1-indexed; stage1 has no downsample anyway
+            dt = downsample_type if (i + 1) in downsample_stages else 'conv'
             self.stages.append(
                 HG_Stage(
                     in_channels,
@@ -476,7 +503,13 @@ class HGNetv2(nn.Module):
                     downsample,
                     light_block,
                     kernel_size,
-                    use_lab))
+                    use_lab,
+                    downsample_type=dt,
+                    gate_reduction=gate_reduction))
+
+        # A0r control: which stages' downsample must be re-initialized (empty
+        # when reinit_downsample=False, so _solver.py's getattr check is False)
+        self._reinit_stages = list(downsample_stages) if reinit_downsample else []
 
         if freeze_at >= 0:
             self._freeze_parameters(self.stem)
@@ -529,6 +562,32 @@ class HGNetv2(nn.Module):
                     f"{download_url} to {local_model_dir}. "
                     "If you replaced backbone submodules, set HGNetv2.pretrained_strict=False."
                 ) from e
+
+        if self._reinit_stages:
+            self.reinit_downsample_layers()
+
+    def reinit_downsample_layers(self):
+        """A0r control: re-initialize the downsample conv/BN of the configured
+        stages. MUST also be re-applied after the COCO -t weights are loaded
+        (see Solver.load_tuning_state) -- they contain these layers and would
+        otherwise silently overwrite this re-init."""
+        for i in self._reinit_stages:              # 1-indexed
+            for mod in self.stages[i - 1].downsample.modules():
+                if isinstance(mod, nn.Conv2d):
+                    kaiming_normal_(mod.weight, mode='fan_out',
+                                    nonlinearity='relu')
+                elif isinstance(mod, nn.BatchNorm2d):
+                    ones_(mod.weight)
+                    zeros_(mod.bias)
+                    if hasattr(mod, 'reset_running_stats'):
+                        mod.reset_running_stats()
+                elif isinstance(mod, FrozenBatchNorm2d):
+                    # freeze_norm=True converts BN to FrozenBatchNorm2d
+                    # (weight/bias are buffers there)
+                    mod.weight.fill_(1.0)
+                    mod.bias.fill_(0.0)
+        print(f'[HGNetv2] re-initialized downsample of stages '
+              f'{list(self._reinit_stages)}')
 
 
 

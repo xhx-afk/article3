@@ -9,6 +9,7 @@ Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
 import sys
 import math
+import os
 from typing import Iterable
 
 import torch
@@ -46,7 +47,15 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
 
         if scaler is not None:
-            with torch.autocast(device_type=str(device), cache_enabled=True):
+            # AMP dtype: fp16 by default (bit-identical to before); set
+            # AMP_BF16=1 to switch to bfloat16 -- same dynamic range as
+            # fp32, immune to fp16 activation overflow (the encoder
+            # lateral-conv spike that NaN'd A1 at epoch 11, diagnosed via
+            # NaN.pth: BN running stats poisoned, all trainable weights clean)
+            amp_dtype = torch.bfloat16 if os.environ.get('AMP_BF16') == '1' \
+                else torch.float16
+            with torch.autocast(device_type=str(device), dtype=amp_dtype,
+                                cache_enabled=True):
                 outputs = model(samples, targets=targets)
 
             if torch.isnan(outputs['pred_boxes']).any() or torch.isinf(outputs['pred_boxes']).any():

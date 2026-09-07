@@ -1,0 +1,14 @@
+# A0r 对照组：保持 conv 下采样，但把 stage2/3/4 的下采样层重新初始化。
+# 回答"基线的下采样权重（ImageNet+COCO）本身值多少"。
+# 注意：不要加 pretrained_strict: False —— A0r 的键名没变，strict 应当仍然
+# 通过，这本身是一个有用的校验。
+# 验收：训练日志必须出现 re-initialized / re-applied 两行，且第 1 个 epoch
+# 的 loss 明显高于 baseline 第 1 个 epoch。
+__include__: ["./coated_wood_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood/A0r_conv_reinit_s_640_e132_seed0
+
+HGNetv2:
+  downsample_type: conv
+  downsample_stages: [2, 3, 4]
+  reinit_downsample: True

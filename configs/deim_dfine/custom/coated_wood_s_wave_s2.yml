@@ -1,0 +1,10 @@
+# A4 消融：只替换 stage2 的下采样（最浅的替换点，噪声最先经过的位置）。
+__include__: ["./coated_wood_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood/A4_wave_gate_s2only_s_640_e132_seed0
+
+HGNetv2:
+  downsample_type: haar_gate
+  downsample_stages: [2]
+  gate_reduction: 4
+  pretrained_strict: False

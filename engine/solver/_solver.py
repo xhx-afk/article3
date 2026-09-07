@@ -186,6 +186,14 @@ class BaseSolver(object):
         module.load_state_dict(stat, strict=False)
         print(f'Load model.state_dict, {infos}')
 
+        # A0r control: re-apply the downsample re-init AFTER the COCO -t
+        # weights are loaded (they contain these layers and would otherwise
+        # overwrite the re-init done in HGNetv2.__init__)
+        bb = getattr(module, 'backbone', None)
+        if getattr(bb, '_reinit_stages', None):
+            bb.reinit_downsample_layers()
+            print('[solver] re-applied downsample re-init after tuning-state load')
+
     @staticmethod
     def _matched_state(state: Dict[str, torch.Tensor], params: Dict[str, torch.Tensor]):
         missed_list = []

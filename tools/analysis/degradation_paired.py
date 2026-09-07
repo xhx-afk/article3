@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -124,6 +125,40 @@ def contrast_tertiles(values, labels=('low', 'mid', 'high')):
     return np.asarray(binned.astype(object))
 
 
+def export_contrast_groups(instances, out_path, source_desc):
+    """Write the contrast tertiles as the groups json consumed by
+    `effective_n --gt-subset`.
+
+    ann ids are the annotation ids on the ODC images of the FULL val ann
+    (stratified AP is computed on the ODC subset). Instances with nan contrast
+    (ring < 50 px) belong to NO group; groups are disjoint by construction.
+    """
+    groups = {t: [] for t in ('low', 'mid', 'high')}
+    n_nan = 0
+    for inst in instances:
+        t = inst.get('contrast_tertile')
+        if t is None:
+            n_nan += 1
+            continue
+        groups[t].append(int(inst['ann_id']))
+    payload = {
+        'name': 'contrast_tertile',
+        'groups': groups,
+        'source': source_desc,
+        'n_without_group': n_nan,
+        'created': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    }
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open('w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+    print(f'[export-groups] low/mid/high = '
+          f'{len(groups["low"])}/{len(groups["mid"])}/{len(groups["high"])} '
+          f'(unassigned nan-contrast: {n_nan}) -> {out_path}')
+    return payload
+
+
 # -----------------------------------------------------------------------------
 # Instance table + paired matching
 # -----------------------------------------------------------------------------
@@ -148,6 +183,7 @@ def build_instance_table(gt_index, images):
                 'area': bx[2] * bx[3],
                 'bbox': bx,
                 'image_id': iid,
+                'ann_id': int(ann['id']),   # used by --export-groups
                 'contrast': float('nan'),
                 'contrast_tertile': None,
             })
@@ -323,6 +359,11 @@ def run(args):
     print(f'[out] {out_dir / "paired_instances.csv"}')
     print(f'[out] {out_dir / "summary.json"}')
 
+    # P6: contrast-tertile groups for effective_n --gt-subset (stratified AP)
+    if args.export_groups:
+        export_contrast_groups(instances, args.export_groups,
+                               source_desc=str(out_dir / 'paired_instances.csv'))
+
 
 # -----------------------------------------------------------------------------
 # Self-test
@@ -417,18 +458,20 @@ def self_test():
     # 4. pairing: 2 src x 2 dir x 5 codes, identical GT geometry
     images, gt_index = {}, {}
     iid = 0
+    aid = 1
     for s in (1, 2):
         for d in (0, 1):
             for code in CODES:
                 images[iid] = {'file_name': f'{s:06d}_{code}_{d:05d}.jpg'}
                 gt_index[iid] = [
-                    {'image_id': iid, 'category_id': 1,
+                    {'id': aid, 'image_id': iid, 'category_id': 1,
                      'bbox': [10.0, 10.0, 20.0, 20.0], 'area': 400.0,
                      'iscrowd': 0},
-                    {'image_id': iid, 'category_id': 2,
+                    {'id': aid + 1, 'image_id': iid, 'category_id': 2,
                      'bbox': [50.0, 50.0, 15.0, 15.0], 'area': 225.0,
                      'iscrowd': 0},
                 ]
+                aid += 2
                 iid += 1
     instances = build_instance_table(gt_index, images)
     check('instance keys == 2 src x 2 dir x 2 gt',
@@ -448,6 +491,32 @@ def self_test():
     check('edge box -> nan contrast branch',
           (not np.isfinite(contrast)) and n_ring < 50,
           f'contrast={contrast} n_ring={n_ring}')
+
+    # 6. --export-groups format: disjoint groups, all non-nan instances
+    #    covered, json keys match the effective_n --gt-subset contract
+    import tempfile
+    tmpd = tempfile.mkdtemp(prefix='degra_export_')
+    insts = []
+    for i in range(12):
+        insts.append({'src': str(i // 4), 'direction': str(i % 2),
+                      'cls': 1, 'area': 100.0, 'bbox': [0, 0, 10, 10],
+                      'image_id': i, 'ann_id': 100 + i,
+                      'contrast': float(i),
+                      'contrast_tertile': ('low', 'mid', 'high')[i % 3]})
+    insts.append({'src': '9', 'direction': '0', 'cls': 1, 'area': 100.0,
+                  'bbox': [0, 0, 4, 4], 'image_id': 99, 'ann_id': 999,
+                  'contrast': float('nan'), 'contrast_tertile': None})
+    payload = export_contrast_groups(
+        insts, Path(tmpd) / 'groups.json', source_desc='toy.csv')
+    all_ids = [a for g in payload['groups'].values() for a in g]
+    check('export: groups disjoint and complete (nan excluded)',
+          len(all_ids) == len(set(all_ids)) == 12 and
+          999 not in all_ids and
+          payload['n_without_group'] == 1)
+    check('export: json contract keys present',
+          payload['name'] == 'contrast_tertile' and
+          set(payload['groups']) == {'low', 'mid', 'high'} and
+          'created' in payload and 'source' in payload)
 
     if failures:
         print(f'SELF-TESTS FAILED: {failures}')
@@ -469,6 +538,9 @@ def main():
     ap.add_argument('--ring-scale', type=float, default=0.6)
     ap.add_argument('--exclude-other-gt', action='store_true',
                     help='remove pixels inside other GT boxes from the ring')
+    ap.add_argument('--export-groups', default=None,
+                    help='write the contrast-tertile groups json here '
+                         '(input format of effective_n --gt-subset)')
     ap.add_argument('--self-test-only', action='store_true')
     args = ap.parse_args()
 

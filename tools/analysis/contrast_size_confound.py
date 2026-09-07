@@ -111,6 +111,22 @@ def permutation_p(det, ct, st, n_perm=2000, seed=0):
     return (cnt + 1) / (n_perm + 1), obs
 
 
+def holm(pvals):
+    """Holm–Bonferroni 逐步校正：升序排列，第 i 个乘 (N-i)，累积取最大保证单调。
+
+    为什么必须校正（方法论纪律 #11）：对 4 个增强码各做一次置换检验，
+    报其中最小的 raw p 就是 4 次检验里挑 1 次 —— PDC 的 raw p=0.0325
+    校正后是 0.13，结论会从“显著”翻转成“不显著”。
+    """
+    idx = sorted(range(len(pvals)), key=lambda i: pvals[i])
+    out, prev = [0.0] * len(pvals), 0.0
+    for r, i in enumerate(idx):
+        v = min(1.0, max(prev, (len(pvals) - r) * pvals[i]))
+        out[i] = v
+        prev = v
+    return out
+
+
 def analyze(rows, codes, n_perm, seed):
     contrast = np.array([float(r['contrast']) for r in rows])
     area = np.array([float(r['area']) for r in rows])
@@ -140,6 +156,8 @@ def analyze(rows, codes, n_perm, seed):
     out['tertile_composition'] = comp
 
     out['codes'] = {}
+    order = []
+    # ---- pass 1: compute everything, collect the raw p-values ----
     for code in codes:
         key = f'det_{code}'
         if key not in rows[0]:
@@ -160,30 +178,47 @@ def analyze(rows, codes, n_perm, seed):
         pr_c = partial_spearman(cn, d, sz); pr_s = partial_spearman(sz, d, cn)
         eff, per = stratified_effect(d, c_, s_)
         p, _ = permutation_p(d, c_, s_, n_perm, seed)
+        out['codes'][code] = dict(n=int(keep.sum()), survival=float(d.mean()),
+                                  spearman_contrast=r_c, spearman_size=r_s,
+                                  partial_contrast=pr_c, partial_size=pr_s,
+                                  stratified_effect=eff, perm_p=p,
+                                  per_size_stratum=per)
+        order.append(code)
 
-        print(f"\n=== {code}（ODC 确信检出 n={int(keep.sum())}，存活 {d.mean()*100:.1f}%）===")
-        print(f"  边际  Spearman(对比度, 检出) = {r_c:+.3f}   Spearman(尺寸, 检出) = {r_s:+.3f}")
+    # ---- Holm correction across ALL codes (方法论纪律 #11) ----
+    raw_ps = [out['codes'][c]['perm_p'] for c in order]
+    holm_ps = holm(raw_ps) if raw_ps else []
+    for c, ph in zip(order, holm_ps):
+        out['codes'][c]['perm_p_holm'] = ph
+    out['n_tests'] = len(order)
+    print(f"\n共 {len(order)} 次检验，判据按 Holm 校正后的 p 读（raw p 并排列出仅供参考）")
+
+    # ---- pass 2: print per-code detail + verdict based on the HOLM p ----
+    for code in order:
+        e = out['codes'][code]
+        p, ph = e['perm_p'], e['perm_p_holm']
+        pr_c, pr_s = e['partial_contrast'], e['partial_size']
+        print(f"\n=== {code}（ODC 确信检出 n={e['n']}，存活 {e['survival']*100:.1f}%）===")
+        print(f"  边际  Spearman(对比度, 检出) = {e['spearman_contrast']:+.3f}"
+              f"   Spearman(尺寸, 检出) = {e['spearman_size']:+.3f}")
         print(f"  偏相关 对比度|控制尺寸      = {pr_c:+.3f}   尺寸|控制对比度      = {pr_s:+.3f}")
-        print(f"  尺寸层内的对比度效应(高-低) = {eff:+.3f}   置换检验 p = {p:.4f}")
+        print(f"  尺寸层内的对比度效应(高-低) = {e['stratified_effect']:+.3f}"
+              f"   置换检验 p(raw) = {p:.4f}   p(Holm) = {ph:.4f}")
         print(f"  {'尺寸层':8s} {'n低/n高':>10s} {'存活低':>8s} {'存活高':>8s} {'差':>8s}")
-        for k, v in per.items():
+        for k, v in e['per_size_stratum'].items():
             print(f"  {k:8s} {str(v['n_low'])+'/'+str(v['n_high']):>10s} "
                   f"{v['surv_low']*100:7.1f}% {v['surv_high']*100:7.1f}% {v['diff']*100:+7.1f}pt")
 
-        if p < 0.05 and abs(pr_c) > abs(pr_s):
+        if ph < 0.05 and abs(pr_c) > abs(pr_s):
             verd = 'CONTRAST_SURVIVES：控制尺寸后对比度仍显著且主导 → 创新点 3 的前提站得住'
-        elif p < 0.05:
+        elif ph < 0.05:
             verd = 'BOTH：对比度效应显著，但尺寸的偏相关更强 → 创新点 3 应改为对比度+尺寸联合条件化'
         elif abs(pr_s) > abs(pr_c):
             verd = 'SIZE_DOMINATES：控制尺寸后对比度不显著 → 【创新点 3 的动机不成立】，改做尺寸自适应'
         else:
             verd = 'NEITHER：两者都不显著 → 检出难度由别的因素决定，创新点 3 需重新找依据'
-        print(f"  >>> {verd}")
-        out['codes'][code] = dict(n=int(keep.sum()), survival=float(d.mean()),
-                                  spearman_contrast=r_c, spearman_size=r_s,
-                                  partial_contrast=pr_c, partial_size=pr_s,
-                                  stratified_effect=eff, perm_p=p,
-                                  per_size_stratum=per, verdict=verd)
+        print(f"  >>> {verd}（按 Holm 校正后 p={ph:.4f} 判）")
+        e['verdict'] = verd
     return out
 
 
@@ -219,6 +254,21 @@ def self_test():
         f'边际 {spearman(cn2, det2):+.3f}')
     chk('场景B 控制尺寸后对比度被解释掉', abs(prB_c) < abs(prB_s) and effB < effA,
         f'偏相关 对比度 {prB_c:+.3f} < 尺寸 {prB_s:+.3f}; 层内效应 {effB:+.3f} < {effA:+.3f}')
+
+    # ---- Holm 多重比较校正（§3 / 方法论纪律 #11）----
+    h = holm([0.01, 0.04, 0.03])
+    ordered = [h[i] for i in sorted(range(3), key=lambda k: [0.01, 0.04, 0.03][k])]
+    chk('holm 输出（按原 p 升序）单调不减且每个 >= 原值',
+        all(ordered[i] <= ordered[i + 1] + 1e-12 for i in range(2)) and
+        h[0] >= 0.01 and h[1] >= 0.04 and h[2] >= 0.03, str(h))
+    chk('holm 单个检验不变', holm([0.0325]) == [0.0325])
+    chk('holm 全 1.0 输出全 1.0', holm([1.0, 1.0, 1.0]) == [1.0, 1.0, 1.0])
+    hA = holm([pA, 0.5, 0.6, 0.7])
+    hB = holm([pB, 0.5, 0.6, 0.7])
+    chk('场景A（对比度真因果）校正后仍显著', hA[0] < 0.05,
+        f'raw {pA:.4f} -> holm {hA[0]:.4f}')
+    chk('场景B（尺寸真因果）校正后不显著', hB[0] >= 0.05,
+        f'raw {pB:.4f} -> holm {hB[0]:.4f}')
     print('\nALL SELF-TESTS PASSED' if not fails else f'\nFAILED: {fails}')
     return 1 if fails else 0
 
@@ -227,7 +277,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--csv'); ap.add_argument('--out')
     ap.add_argument('--codes', nargs='+', default=['PDC', 'GDC', 'LDC', 'DDC'])
-    ap.add_argument('--n-perm', type=int, default=2000)
+    ap.add_argument('--n-perm', type=int, default=5000,
+                    help='置换次数（Holm 校正后阈值更严，分辨率要跟上，默认 5000）')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--self-test-only', action='store_true')
     a = ap.parse_args()

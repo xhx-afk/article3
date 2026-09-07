@@ -528,22 +528,28 @@ def self_test():
     check('half missed -> AP50 == 51/101',
           abs(r.AP50 - 51.0 / 101.0) < 1e-6, f'{r.AP50}')
 
-    # 4. duplicate box must DECREASE AP
-    #    COCO's monotone precision fill ignores trailing low-score FPs, so the
-    #    duplicate scores are interleaved between the perfect boxes (this is
-    #    the standard way FPs enter the interpolated precision curve).
+    # 4a. trailing duplicate boxes AFTER full recall: AP must NOT change
+    #     (COCO's 101-point interpolation ignores FPs that come after
+    #     recall == 1.0; the pre-audit test #4 used INTERLEAVED scores,
+    #     which is a different, also-correct construction -- see README audit)
     gt = _toy_gt(None, 10)
-    dt_good, dt_dup = [], []
-    for i in range(10):
-        s_good = 1.0 - 0.05 * i
-        dt_good.append({'image_id': i, 'category_id': 1,
-                        'bbox': [0, 0, 100, 100], 'score': s_good})
-        dt_dup.append({'image_id': i, 'category_id': 1,
-                       'bbox': [0, 0, 100, 100], 'score': s_good - 0.025})
-    dt_all = dt_good + dt_dup
+    dt_good = [{'image_id': i, 'category_id': 1,
+                'bbox': [0, 0, 100, 100], 'score': 0.9} for i in range(10)]
+    dt_tail = dt_good + [{'image_id': i, 'category_id': 1,
+                          'bbox': [0, 0, 100, 100], 'score': 0.5}
+                         for i in range(10)]
     ap_good = coco_ap(gt, dt_good).AP
-    ap_dup = coco_ap(gt, dt_all).AP
-    check('duplicate box lowers AP', ap_dup < ap_good, f'{ap_dup} vs {ap_good}')
+    ap_tail = coco_ap(gt, dt_tail).AP
+    check('4a trailing duplicates after full recall -> AP unchanged (bit-exact)',
+          ap_tail == ap_good, f'{ap_tail} vs {ap_good}')
+
+    # 4b. high-score background FPs BEFORE the TPs: AP must DROP by >= 1.0
+    dt_bg = ([{'image_id': i, 'category_id': 1,
+               'bbox': [300, 300, 50, 50], 'score': 0.99} for i in range(3)]
+             + dt_good)
+    ap_bg = coco_ap(gt, dt_bg).AP
+    check('4a/4b high-score background FP lowers AP by >= 1.0',
+          (ap_good - ap_bg) * 100.0 >= 1.0, f'{ap_bg} vs {ap_good}')
 
     # 5. pycocotools cross-check (30 images / 4 cats / noisy preds)
     try:

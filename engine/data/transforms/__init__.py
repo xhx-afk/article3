@@ -17,6 +17,7 @@ from ._transforms import (
     Normalize,
     ConvertBoxes,
     ConvertPILImage,
+    OfflineEquivalentNoise,
 )
 from .container import Compose
 from .mosaic import Mosaic

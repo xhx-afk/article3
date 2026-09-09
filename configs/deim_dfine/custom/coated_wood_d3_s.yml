@@ -1,0 +1,50 @@
+# D3 = D1 的数据（ODC+LDC+DDC，5496 张）+ 在线等效噪声（每次重采样）。
+# ⚠️ 本文件已手工插入 OfflineEquivalentNoise，**不要用 make_dataset_config.py 重新生成覆盖**。
+# 机制对照（S3）：与 D0 的噪声暴露分布完全相同，唯一差别是"固定实现 vs 每次重采样"。
+# 前提已由 N6 验证：在线 σ(ΔE) 与离线换算相差 < 5%（78.70 vs 78.80 / 76.92 vs 75.62）。
+__include__: ["./coated_wood_d1_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood/D3_s_640_e220_seed0
+
+train_dataloader:
+  dataset:
+    transforms:
+      # 完整重写 ops（与继承链逐条一致），只为在 ConvertPILImage 之后插入一条噪声。
+      # 字面值代替 anchor：YAML anchor 不跨文件，本文件里没有那些锚点定义。
+      ops:
+        - {
+            type: Mosaic,
+            output_size: 320,
+            rotation_range: 10,
+            translation_range: [0.1, 0.1],
+            scaling_range: [0.5, 1.5],
+            probability: 1.0,
+            fill_value: 0,
+            use_cache: False,
+            max_cached_images: 50,
+            random_pop: True,
+          }
+        - { type: RandomPhotometricDistort, p: 0.5 }
+        - { type: RandomZoomOut, fill: 0 }
+        - { type: RandomIoUCrop, p: 0.8 }
+        - { type: SanitizeBoundingBoxes, min_size: 1 }
+        - { type: RandomHorizontalFlip }
+        - { type: Resize, size: [640, 640] }
+        - { type: SanitizeBoundingBoxes, min_size: 1 }
+        - { type: ConvertPILImage, dtype: "float32", scale: True }
+        # ↓ 在线等效噪声：必须在 ConvertPILImage 之后（张量已是 float [0,1]）、
+        #   ConvertBoxes 之前；参数 = 数据集公开增强代码的硬参数
+        #   （imnoise gaussian 0,0.25 → σ=0.5；salt & pepper 0.2 → density=0.2 逐通道）；
+        #   p=0.2/0.2 对应离线数据里 GDC/PDC 各占 1/5。
+        #   ⚠️ 绝不能写进下面的 policy.ops：不在 policy 列表里的算子每个 epoch 都执行，
+        #      这正是我们要的（离线噪声全程存在，含最后 12 个 no-aug epoch）。
+        - {
+            type: OfflineEquivalentNoise,
+            sigma: 0.5,
+            density: 0.2,
+            p_gaussian: 0.2,
+            p_salt_pepper: 0.2,
+          }
+        - { type: ConvertBoxes, fmt: "cxcywh", normalize: True }
+      # policy 保持继承（stop_epoch，epoch [4, 108, 208]，四个强增强算子），
+      # OfflineEquivalentNoise 不在其中 → 全程生效。

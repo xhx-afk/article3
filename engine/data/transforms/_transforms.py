@@ -135,3 +135,44 @@ class ConvertPILImage(T.Transform):
         inpt = Image(inpt)
 
         return inpt
+
+
+@register()
+class OfflineEquivalentNoise(T.Transform):
+    """在线复现离线增强的噪声，但每次重新采样。
+
+    用于 online/offline 对照：离线增强每张图只有一个固定噪声实现，
+    在 132 个 epoch 里被看 132 遍（可记忆）；在线重采样则是正则化。
+    若 D3(online) 显著优于 D0(offline)，说明损害来自“固定实现被记忆”，
+    而不是噪声本身。
+
+    参数默认值 = 数据集公开增强代码的硬参数：
+      GaussianNoise.m    imnoise(I,'gaussian',0,0.25) -> sigma = 0.5
+      SaltPepperBatch.m  imnoise(I,'salt & pepper',0.2) -> density = 0.2（逐通道）
+    p_gaussian / p_salt_pepper 默认 0.2 / 0.2，对应离线数据里 GDC/PDC 各占 1/5。
+
+    只作用于图像张量（_transformed_types 限定），不碰任何 box。
+    必须放在 ConvertPILImage 之后（那时张量是 float [0,1]）。
+    绝不能写进 policy.ops：不在 policy 列表里的算子每个 epoch 都执行，
+    这正是我们要的（离线数据里噪声全程存在，含最后 12 个 no-aug epoch）。
+    """
+    _transformed_types = (Image,)
+
+    def __init__(self, sigma=0.5, density=0.2,
+                 p_gaussian=0.2, p_salt_pepper=0.2) -> None:
+        super().__init__()
+        self.sigma, self.density = sigma, density
+        self.p_gaussian, self.p_salt_pepper = p_gaussian, p_salt_pepper
+
+    def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+        x = inpt
+        r = torch.rand(())                       # 每个样本一次抽样，两种噪声互斥
+        if r < self.p_gaussian:
+            x = x + torch.randn_like(x) * self.sigma
+        elif r < self.p_gaussian + self.p_salt_pepper:
+            m = torch.rand_like(x) < self.density          # 逐通道独立，与 imnoise 一致
+            salt = torch.rand_like(x) < 0.5
+            x = torch.where(m, salt.to(x.dtype), x)
+        else:
+            return inpt
+        return Image(x.clamp_(0.0, 1.0))

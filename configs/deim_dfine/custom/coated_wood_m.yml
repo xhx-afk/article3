@@ -30,8 +30,8 @@ ema:
 train_dataloader:
   total_batch_size: 32
   dataset:
-    img_folder: ./datasets\Water-Based-Coated-Wood/images/train
-    ann_file: ./datasets\Water-Based-Coated-Wood/annotations/instances_train.json
+    img_folder: ./datasets/Water-Based-Coated-Wood/images/train
+    ann_file: ./datasets/Water-Based-Coated-Wood/annotations/instances_train.json
     transforms:
       policy:
         name: stop_epoch
@@ -49,5 +49,5 @@ train_dataloader:
 val_dataloader:
   total_batch_size: 32
   dataset:
-    img_folder: ./datasets\Water-Based-Coated-Wood/images/val
-    ann_file: ./datasets\Water-Based-Coated-Wood/annotations/instances_val.json
+    img_folder: ./datasets/Water-Based-Coated-Wood/images/val
+    ann_file: ./datasets/Water-Based-Coated-Wood/annotations/instances_val.json

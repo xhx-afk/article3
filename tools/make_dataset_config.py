@@ -23,6 +23,7 @@
 import argparse
 import math
 import os
+import sys
 
 # 官方 DEIM 配方里固定不变的两个数
 STAGE_START = 4
@@ -37,14 +38,30 @@ REF_LR = {
 }
 
 # 五个数据集的默认参数。train_size 请按你实际划分后的训练集张数改。
+# epoches 可以是 int，也可以是 {model: int}（coated_wood 的 S/M 配方轮数不同）。
 PRESETS = {
-    # name           model_default  num_classes  train_size  epoches  subdir
+    # name           model_default  num_classes  train_size  epoches            subdir
     "neu_det":       dict(num_classes=6,  train_size=1440,  epoches=200, subdir="NEU-DET"),
     "gc10_det":      dict(num_classes=10, train_size=1840,  epoches=200, subdir="GC10-DET"),
-    "coated_wood":   dict(num_classes=4,  train_size=10720, epoches=120, subdir="CoatedWood"),
+    "coated_wood":   dict(num_classes=4,  train_size=9160,  epoches={"s": 132, "m": 102},
+                          subdir="Water-Based-Coated-Wood"),
     "vn_woodknot":   dict(num_classes=1,  train_size=4000,  epoches=120, subdir="VNWoodKnot"),
     "kodytek_wood":  dict(num_classes=7,  train_size=16220, epoches=80,  subdir="KodytekWood"),
 }
+
+# 官方 DEIM 配方的增强锚点（flat_epoch / no_aug_epoch / aug_stop_epoch），
+# 来自父 yml（deim_hgnetv2_{s,m}_custom.yml）。生成后必须对上，否则 exit 1。
+OFFICIAL_ANCHORS = {
+    "s": (64, 12, 120),
+    "m": (49, 12, 90),
+}
+
+
+def resolve_epoches(epoches, model):
+    """epoches 允许是 int 或 {model: int}，按 model 解析。"""
+    if isinstance(epoches, dict):
+        return epoches[model]
+    return epoches
 
 
 def derive_schedule(epoches: int, train_size: int, batch: int):
@@ -194,6 +211,26 @@ def build(model, name, num_classes, train_size, epoches, batch, imgsz,
     return "\n".join(L)
 
 
+def check_anchors(name, model, sch):
+    """coated_wood 生成后把推导锚点与官方 DEIM 配方对照，不一致直接 exit 1。
+    其它 preset 的轮数配方本就不同，不受此检查约束。"""
+    if name != "coated_wood" or model not in OFFICIAL_ANCHORS:
+        return
+    flat, no_aug, aug_stop = OFFICIAL_ANCHORS[model]
+    got = (sch["stage_middle_epoch"], sch["no_aug_epoch"], sch["aug_stop_epoch"])
+    pct = sch["warmup_iter"] / sch["total_iters"] * 100
+    if got == (flat, no_aug, aug_stop):
+        verdict = f"matches official {model.upper()} anchors ({flat}/{no_aug}/{aug_stop})"
+    else:
+        verdict = (f"MISMATCH vs official {model.upper()} anchors "
+                   f"({flat}/{no_aug}/{aug_stop})")
+    print(f"[check] {model}: it/ep={sch['iters_per_epoch']} total={sch['total_iters']} "
+          f"warmup={sch['warmup_iter']}({pct:.2f}%) flat={got[0]} no_aug={got[1]} "
+          f"aug_stop={got[2]}  -> {verdict}")
+    if got != (flat, no_aug, aug_stop):
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=["s", "m"], default="s")
@@ -217,11 +254,11 @@ def main():
         for name, cfg in PRESETS.items():
             for model in ("s", "m"):
                 jobs.append((model, name, cfg["num_classes"], cfg["train_size"],
-                             cfg["epoches"], cfg["subdir"]))
+                             resolve_epoches(cfg["epoches"], model), cfg["subdir"]))
     elif args.preset:
         cfg = PRESETS[args.preset]
         jobs.append((args.model, args.preset, cfg["num_classes"], cfg["train_size"],
-                     cfg["epoches"], cfg["subdir"]))
+                     resolve_epoches(cfg["epoches"], args.model), cfg["subdir"]))
     else:
         assert args.name and args.num_classes and args.train_size and args.epoches, \
             "不用 --preset 时必须给 --name --num-classes --train-size --epoches"
@@ -237,6 +274,7 @@ def main():
         sch = derive_schedule(ep, ts, args.batch)
         print(f"[ok] {path}  epoches={ep} flat={sch['stage_middle_epoch']} "
               f"aug_stop={sch['aug_stop_epoch']} warmup={sch['warmup_iter']}")
+        check_anchors(name, model, sch)
 
 
 if __name__ == "__main__":

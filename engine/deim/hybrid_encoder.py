@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .utils import get_activation
+from .srff import SelectiveRobustFrequencyFusion
 
 from ..core import register
 
@@ -300,6 +301,12 @@ class HybridEncoder(nn.Module):
                  act='silu',
                  eval_spatial_size=None,
                  version='dfine',
+                 use_srff=False,
+                 srff_gaussian_kernel=5,
+                 srff_trim_kernel=3,
+                 srff_gate_hidden=16,
+                 srff_gate_init_bias=-4.0,
+                 srff_eps=1e-6,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -362,6 +369,25 @@ class HybridEncoder(nn.Module):
                 if version == 'dfine' else CSPLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion, bottletype=VGGBlock)
             )
 
+        # optional SRFF v1 (第一创新点)：仅接入 top-down 低层分支，默认关闭。
+        # use_srff=False 时不创建任何可训练 block，保证 baseline state dict 与参数量不受影响。
+        # use_srff=True 时创建 len(in_channels)-1 个互不共享参数的 block（固定 Gaussian 核各自为 buffer）。
+        self.use_srff = use_srff
+        if use_srff:
+            self.srff_blocks = nn.ModuleList([
+                SelectiveRobustFrequencyFusion(
+                    channels=hidden_dim,
+                    gaussian_kernel=srff_gaussian_kernel,
+                    trim_kernel=srff_trim_kernel,
+                    gate_hidden=srff_gate_hidden,
+                    gate_init_bias=srff_gate_init_bias,
+                    eps=srff_eps,
+                )
+                for _ in range(len(in_channels) - 1)
+            ])
+        else:
+            self.srff_blocks = None
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -414,12 +440,23 @@ class HybridEncoder(nn.Module):
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
         for idx in range(len(self.in_channels) - 1, 0, -1):
+            module_idx = len(self.in_channels) - 1 - idx
             feat_heigh = inner_outs[0]
             feat_low = proj_feats[idx - 1]
-            feat_heigh = self.lateral_convs[len(self.in_channels) - 1 - idx](feat_heigh)
+            feat_heigh = self.lateral_convs[module_idx](feat_heigh)
             inner_outs[0] = feat_heigh
-            upsample_feat = F.interpolate(feat_heigh, scale_factor=2., mode='nearest')
-            inner_out = self.fpn_blocks[len(self.in_channels)-1-idx](torch.concat([upsample_feat, feat_low], dim=1))
+
+            if self.use_srff:
+                # 只在 feat_low 进入 concat 之前做选择性校正；feat_heigh 仅作结构证据，禁止覆盖。
+                feat_low = self.srff_blocks[module_idx](feat_heigh, feat_low)
+                upsample_feat = F.interpolate(
+                    feat_heigh, size=feat_low.shape[-2:], mode='nearest'
+                )
+            else:
+                # 保留 baseline 原语句，降低关闭 SRFF 时出现行为漂移的风险。
+                upsample_feat = F.interpolate(feat_heigh, scale_factor=2., mode='nearest')
+
+            inner_out = self.fpn_blocks[module_idx](torch.concat([upsample_feat, feat_low], dim=1))
             inner_outs.insert(0, inner_out)
 
         outs = [inner_outs[0]]

@@ -1,0 +1,37 @@
+# SRFF v1（第一创新点）快速验证配置 —— DEIM-S / 涂饰木 4 类 / 72 epoch
+# ---------------------------------------------------------------------------
+# 目的：为加快验证，把 S 配方从 132 epoch 缩到 72 epoch（复用 coated_wood_fast_s.yml）。
+# 本文件只做两件事：
+#   1) 覆盖 output_dir，与 fast baseline、132ep 实验隔离；
+#   2) 打开 HybridEncoder 的 SRFF 开关（默认关闭）。
+# 其余全部沿用 ./coated_wood_fast_s.yml（数据集 / 72ep 调度锚点 / LR / 增强 / batch 32）。
+#
+# ⚠️ 科学性约束（务必遵守，否则结果不可归因）：
+#   * baseline 与 SRFF 必须都用 72ep 快速配方：
+#       baseline = configs/deim_dfine/custom/coated_wood_fast_s.yml
+#       SRFF     = 本文件
+#     二者的 epoch/调度/LR/增强/batch/seed/预训练权重/卡数必须逐字一致。
+#   * 72ep 结果是“快速代理”，绝对 AP 会低于 132ep，且与验收文档的参考值
+#     （ODC 52.18 等）和门槛（基于 132ep）不可直接比较；论文最终结论仍需回到
+#     132ep 多 seed 重跑。
+#
+# 权重加载：新建 SRFF 用 -t（tuning）；禁止用 -r 拿无 SRFF 的 baseline 续跑。
+#
+# 训练（两卡，示例）：
+#   torchrun --master_port=7772 --nproc_per_node=2 train.py \
+#     -c configs/deim_dfine/custom/coated_wood_fast_s_srff_v1.yml \
+#     -t /path/to/deim_dfine_hgnetv2_s_coco.pth --use-amp --seed 0
+# ---------------------------------------------------------------------------
+
+__include__:
+  - ./coated_wood_fast_s.yml
+
+output_dir: ./deim_outputs/coated_wood_fast/srff_v1/deim_s_640_e72_seed0
+
+HybridEncoder:
+  use_srff: True
+  srff_gaussian_kernel: 5
+  srff_trim_kernel: 3
+  srff_gate_hidden: 16
+  srff_gate_init_bias: -4.0
+  srff_eps: 1.0e-6

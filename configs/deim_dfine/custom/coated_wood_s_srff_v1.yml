@@ -1,0 +1,32 @@
+# SRFF v1（第一创新点）独立实验配置 —— DEIM-S / 涂饰木 4 类
+# ---------------------------------------------------------------------------
+# 本文件只做两件事：
+#   1) 覆盖 output_dir，与 baseline 输出隔离；
+#   2) 打开 HybridEncoder 的 SRFF 开关（默认关闭）。
+# 其余全部沿用 ./coated_wood_s.yml（数据集路径 / epoch / LR / 增强调度 / S 配方），
+# 不复制、不重写，保证除 SRFF 与输出目录外训练配方逐字一致。
+#
+# 权重加载规则（见实现文档第 8 节）：
+#   * 新建 SRFF 实验用 tuning（-t）从 COCO/baseline 预训练权重出发，
+#     新 SRFF 参数不存在于预训练权重时保留本模块的近恒等初始化；
+#   * 禁止用 -r 把无 SRFF 的 baseline 当作 SRFF 续跑（结构不匹配，resume 是严格恢复）；
+#   * 只有从本 SRFF 配置产生的 checkpoint 才能用 -r 续训。
+#
+# 训练（两卡，示例）：
+#   torchrun --master_port=7777 --nproc_per_node=2 train.py \
+#     -c configs/deim_dfine/custom/coated_wood_s_srff_v1.yml \
+#     -t /path/to/deim_dfine_hgnetv2_s_coco.pth --use-amp --seed 0
+# ---------------------------------------------------------------------------
+
+__include__:
+  - ./coated_wood_s.yml
+
+output_dir: ./deim_outputs/coated_wood/srff_v1/deim_s_640_e132_seed0
+
+HybridEncoder:
+  use_srff: True
+  srff_gaussian_kernel: 5
+  srff_trim_kernel: 3
+  srff_gate_hidden: 16
+  srff_gate_init_bias: -4.0
+  srff_eps: 1.0e-6

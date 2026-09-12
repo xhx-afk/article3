@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from .utils import get_activation
 from .srff import SelectiveRobustFrequencyFusion
+from .srff_v1_1 import SelectiveRobustFrequencyFusionV11
 
 from ..core import register
 
@@ -307,6 +308,10 @@ class HybridEncoder(nn.Module):
                  srff_gate_hidden=16,
                  srff_gate_init_bias=-4.0,
                  srff_eps=1e-6,
+                 srff_version='v1',
+                 srff_active_levels=None,
+                 srff_global_threshold_low=0.78,
+                 srff_global_threshold_high=0.80,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -369,24 +374,50 @@ class HybridEncoder(nn.Module):
                 if version == 'dfine' else CSPLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion, bottletype=VGGBlock)
             )
 
-        # optional SRFF v1 (第一创新点)：仅接入 top-down 低层分支，默认关闭。
-        # use_srff=False 时不创建任何可训练 block，保证 baseline state dict 与参数量不受影响。
-        # use_srff=True 时创建 len(in_channels)-1 个互不共享参数的 block（固定 Gaussian 核各自为 buffer）。
+        # optional SRFF（第一创新点）：仅接入 top-down 低层分支，默认关闭。
+        # use_srff=False：不创建任何可训练 block，baseline state dict 与参数量不受影响。
+        # srff_version：'v1' -> SelectiveRobustFrequencyFusion；'v1_1' -> V11（外层加全局退化触发门）。
+        # srff_active_levels：指定启用 SRFF 的 module_idx；None 表示全部（保持 V1 两级行为）。
+        #   inactive level 放 nn.Identity()（无可训练参数），forward 走 baseline 插值分支，
+        #   state dict 中不含该层 srff_blocks.* 参数（满足 V1.1 单层启用要求）。
         self.use_srff = use_srff
+        self.srff_version = srff_version
+        num_srff_levels = len(in_channels) - 1
         if use_srff:
+            if srff_active_levels is None:
+                active_levels = list(range(num_srff_levels))
+            else:
+                active_levels = [int(x) for x in srff_active_levels]
+                assert len(active_levels) == len(set(active_levels)), \
+                    f'srff_active_levels 必须唯一: {srff_active_levels}'
+                for a in active_levels:
+                    assert 0 <= a <= num_srff_levels - 1, \
+                        f'非法 srff active level {a}，必须在 [0, {num_srff_levels - 1}]'
+                active_levels = sorted(active_levels)
+            if srff_version == 'v1':
+                def _make_srff_block():
+                    return SelectiveRobustFrequencyFusion(
+                        channels=hidden_dim, gaussian_kernel=srff_gaussian_kernel,
+                        trim_kernel=srff_trim_kernel, gate_hidden=srff_gate_hidden,
+                        gate_init_bias=srff_gate_init_bias, eps=srff_eps)
+            elif srff_version == 'v1_1':
+                def _make_srff_block():
+                    return SelectiveRobustFrequencyFusionV11(
+                        channels=hidden_dim, gaussian_kernel=srff_gaussian_kernel,
+                        trim_kernel=srff_trim_kernel, gate_hidden=srff_gate_hidden,
+                        gate_init_bias=srff_gate_init_bias, eps=srff_eps,
+                        global_threshold_low=srff_global_threshold_low,
+                        global_threshold_high=srff_global_threshold_high)
+            else:
+                raise ValueError(f'未知 srff_version={srff_version!r}，仅支持 "v1" / "v1_1"')
             self.srff_blocks = nn.ModuleList([
-                SelectiveRobustFrequencyFusion(
-                    channels=hidden_dim,
-                    gaussian_kernel=srff_gaussian_kernel,
-                    trim_kernel=srff_trim_kernel,
-                    gate_hidden=srff_gate_hidden,
-                    gate_init_bias=srff_gate_init_bias,
-                    eps=srff_eps,
-                )
-                for _ in range(len(in_channels) - 1)
+                _make_srff_block() if idx in active_levels else nn.Identity()
+                for idx in range(num_srff_levels)
             ])
+            self.srff_active_levels = set(active_levels)
         else:
             self.srff_blocks = None
+            self.srff_active_levels = set()
 
         self._reset_parameters()
 
@@ -446,14 +477,15 @@ class HybridEncoder(nn.Module):
             feat_heigh = self.lateral_convs[module_idx](feat_heigh)
             inner_outs[0] = feat_heigh
 
-            if self.use_srff:
-                # 只在 feat_low 进入 concat 之前做选择性校正；feat_heigh 仅作结构证据，禁止覆盖。
+            srff_active = self.use_srff and module_idx in self.srff_active_levels
+            if srff_active:
+                # 只在 active level 的 feat_low 进入 concat 之前做选择性校正；feat_heigh 仅作结构证据，禁止覆盖。
                 feat_low = self.srff_blocks[module_idx](feat_heigh, feat_low)
                 upsample_feat = F.interpolate(
                     feat_heigh, size=feat_low.shape[-2:], mode='nearest'
                 )
             else:
-                # 保留 baseline 原语句，降低关闭 SRFF 时出现行为漂移的风险。
+                # inactive level / use_srff=False：保留 baseline 原语句，行为逐位一致。
                 upsample_feat = F.interpolate(feat_heigh, scale_factor=2., mode='nearest')
 
             inner_out = self.fpn_blocks[module_idx](torch.concat([upsample_feat, feat_low], dim=1))

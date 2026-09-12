@@ -1,0 +1,35 @@
+# SRFF-V1.1（全局退化触发的单层安全残差融合）快速验证配置 —— DEIM-S / 涂饰木 4 类 / 72 epoch
+# ---------------------------------------------------------------------------
+# 依据 SRFF-V1.1-改进实现文档-Agent.md：在 V1 之上做单原因改进——
+#   * 只保留真正起作用的 P5→P4 融合层（srff_active_levels: [0]），P4→P3 层完全旁路走 baseline；
+#   * 外层加按样本的全局退化触发门（smoothstep tau=[0.78,0.80]），clean-like 走恒等、degraded-like 保留 V1。
+# 本文件只 include fast72 baseline 并覆盖 SRFF 字段；不复制/重写 dataset/epoch/LR/增强。
+#
+# ⚠️ 科学性约束：baseline 与 V1.1 必须同 72ep 配方、同 seed/权重/卡数/batch；
+#   72ep 为快速代理，绝对 AP 低于 132ep，论文结论仍需回到 132ep 多 seed。
+# 禁止：改 epoches/flat_epoch/no_aug_epoch/warmup_iter/batch/LR/EMA/Mosaic/MixUp/stop_epoch/数据路径。
+#
+# 权重加载：新建 V1.1 用 -t（tuning）；禁止用 -r 从 V1 checkpoint 续训 V1.1（结构不同）。
+#
+# 训练（两卡，示例）：
+#   torchrun --master_port=7773 --nproc_per_node=2 train.py \
+#     -c configs/deim_dfine/custom/coated_wood_fast_s_srff_v1_1.yml \
+#     -t /path/to/deim_dfine_hgnetv2_s_coco.pth --use-amp --seed 0
+# ---------------------------------------------------------------------------
+
+__include__:
+  - ./coated_wood_fast_s.yml
+
+output_dir: ./deim_outputs/coated_wood_fast/srff_v1_1/deim_s_640_e72_seed0
+
+HybridEncoder:
+  use_srff: True
+  srff_version: v1_1
+  srff_active_levels: [0]
+  srff_gaussian_kernel: 5
+  srff_trim_kernel: 3
+  srff_gate_hidden: 16
+  srff_gate_init_bias: -4.0
+  srff_eps: 1.0e-6
+  srff_global_threshold_low: 0.78
+  srff_global_threshold_high: 0.80

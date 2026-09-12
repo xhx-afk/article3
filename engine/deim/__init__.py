@@ -12,6 +12,7 @@ from .deim import DEIM
 from .matcher import HungarianMatcher
 from .hybrid_encoder import HybridEncoder
 from .srff import SelectiveRobustFrequencyFusion
+from .srff_v1_1 import SelectiveRobustFrequencyFusionV11
 from .dfine_decoder import DFINETransformer
 from .rtdetrv2_decoder import RTDETRTransformerv2
 

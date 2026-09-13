@@ -24,7 +24,13 @@ from ..misc import MetricLogger, SmoothedValue, dist_utils
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
-    model.train()
+    # adapter-only（SRFF-V1.2 §3.2 frozen_eval）：整体 eval + 仅 adapter 子树 train，冻结非 adapter BN running stats。
+    _adapter_patterns = kwargs.get('adapter_train_patterns', None)
+    if _adapter_patterns:
+        from ..misc.adapter_freeze import apply_adapter_train_mode
+        apply_adapter_train_mode(model, _adapter_patterns)
+    else:
+        model.train()
     criterion.train()
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))

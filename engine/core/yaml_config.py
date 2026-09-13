@@ -18,6 +18,7 @@ from .yaml_utils import load_config, merge_config, merge_dict
 class YAMLConfig(BaseConfig):
     def __init__(self, cfg_path: str, **kwargs) -> None:
         super().__init__()
+        self.cfg_path = cfg_path  # 供 adapter checkpoint 记录 config SHA256（SRFF-V1.2 §3.4）
 
         cfg = load_config(cfg_path)
         cfg = merge_dict(cfg, kwargs)
@@ -41,7 +42,7 @@ class YAMLConfig(BaseConfig):
     @property
     def postprocessor(self, ) -> torch.nn.Module:
         if self._postprocessor is None and 'postprocessor' in self.yaml_cfg:
-            self._postprocessor = create(self.yaml_cfg['postprocessor'], self.global_cfg)
+            self._postprocessor = create('postprocessor', self.global_cfg)
         return super().postprocessor
 
     @property

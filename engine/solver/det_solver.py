@@ -25,6 +25,16 @@ class DetSolver(BaseSolver):
         self.train()
         args = self.cfg
 
+        # adapter-only（SRFF-V1.2）开关；默认 False，普通训练完全走原逻辑。
+        adapter_enabled = getattr(self, 'adapter_enabled', False)
+        adapter_cfg = getattr(self, 'adapter_cfg', {}) or {}
+        skip_stage_restart = adapter_enabled and bool(adapter_cfg.get('skip_stage_restart', False))
+        adapter_patterns = self.adapter_patterns if adapter_enabled else None
+        frozen_eval = adapter_enabled and bool(adapter_cfg.get('frozen_eval', True))
+        if adapter_enabled:
+            print(f'[adapter-only] skip_stage_restart={skip_stage_restart} frozen_eval={frozen_eval} '
+                  f'patterns={adapter_patterns} use_ema={self.ema is not None}')
+
         n_parameters, model_stats = stats(self.cfg)
         print(model_stats)
         print("-"*42 + "Start training" + "-"*43)
@@ -68,7 +78,7 @@ class DetSolver(BaseSolver):
             if dist_utils.is_dist_available_and_initialized():
                 self.train_dataloader.sampler.set_epoch(epoch)
 
-            if epoch == self.train_dataloader.collate_fn.stop_epoch:
+            if epoch == self.train_dataloader.collate_fn.stop_epoch and not skip_stage_restart:
                 # Rank 0 may still be writing best_stg1.pth from the previous
                 # evaluation while the other ranks have entered this epoch.
                 dist_utils.synchronize()
@@ -90,7 +100,8 @@ class DetSolver(BaseSolver):
                 ema=self.ema, 
                 scaler=self.scaler, 
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
-                writer=self.writer
+                writer=self.writer,
+                adapter_train_patterns=(adapter_patterns if frozen_eval else None)
             )
 
             if not self.self_lr_scheduler:  # update by epoch 
@@ -99,7 +110,7 @@ class DetSolver(BaseSolver):
 
             self.last_epoch += 1
 
-            if self.output_dir and epoch < self.train_dataloader.collate_fn.stop_epoch:
+            if (not adapter_enabled) and self.output_dir and epoch < self.train_dataloader.collate_fn.stop_epoch:
                 checkpoint_paths = [self.output_dir / 'last.pth']
                 # extra checkpoint before LR drop and every 100 epochs
                 if (epoch + 1) % args.checkpoint_freq == 0:
@@ -118,7 +129,9 @@ class DetSolver(BaseSolver):
             )
 
             # TODO
-            for k in test_stats:
+            # adapter-only：跳过默认 best_stg1/stg2 与 stage-restart（其依赖 self.ema；adapter 模式 ema=None 会崩），
+            # 改用下方独立的 adapter checkpoint 逻辑。普通训练 test_stats 原样遍历。
+            for k in ({} if adapter_enabled else test_stats):
                 if self.writer and dist_utils.is_main_process():
                     for i, v in enumerate(test_stats[k]):
                         self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
@@ -157,6 +170,34 @@ class DetSolver(BaseSolver):
                     self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
                     print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
+            # ---- adapter-only checkpoint（§3.4）：last_adapter / adapter_epoch{N} / best_adapter_overall ----
+            if adapter_enabled:
+                from ..misc.adapter_freeze import build_adapter_checkpoint, save_adapter_checkpoint, git_commit
+                ap_overall = None
+                for k in test_stats:
+                    ap_overall = test_stats[k][0]
+                    if self.writer and dist_utils.is_main_process():
+                        for i, v in enumerate(test_stats[k]):
+                            self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+                is_best = ap_overall is not None and ap_overall > top1
+                if is_best:
+                    top1 = ap_overall
+                    best_stat['epoch'] = epoch
+                ck = build_adapter_checkpoint(
+                    self.model, self.optimizer, epoch, self.adapter_patterns,
+                    baseline_sha256=(self._baseline_load_audit or {}).get('checkpoint_sha256'),
+                    config_sha256=getattr(self, '_config_sha256', None),
+                    git=git_commit(), extra={'ap_overall': ap_overall, 'is_best': is_best})
+                if self.output_dir and dist_utils.is_main_process():
+                    save_adapter_checkpoint(self.output_dir / 'last_adapter.pth', ck)
+                    if (epoch + 1) % args.checkpoint_freq == 0:
+                        save_adapter_checkpoint(self.output_dir / f'adapter_epoch{epoch + 1:03d}.pth', ck)
+                    if is_best:
+                        save_adapter_checkpoint(self.output_dir / 'best_adapter_overall.pth', ck)
+                best_stat_print['epoch'] = best_stat.get('epoch', epoch)
+                for k in test_stats:
+                    best_stat_print[k] = test_stats[k][0]
+                print(f'best_stat: {best_stat_print}  (adapter overall AP={ap_overall}, best={is_best})')
 
             log_stats = {
                 **{f'train_{k}': v for k, v in train_stats.items()},

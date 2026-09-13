@@ -42,7 +42,7 @@ class YAMLConfig(BaseConfig):
     @property
     def postprocessor(self, ) -> torch.nn.Module:
         if self._postprocessor is None and 'postprocessor' in self.yaml_cfg:
-            self._postprocessor = create('postprocessor', self.global_cfg)
+            self._postprocessor = create(self.yaml_cfg['postprocessor'], self.global_cfg)
         return super().postprocessor
 
     @property

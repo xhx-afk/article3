@@ -36,7 +36,7 @@ class BaseSolver(object):
             50, 25, 75, 98, 153, 37, 73, 115, 132, 106, 61, 163, 134, 277, 81, 133, 18, 94, 30,
             169, 70, 328, 226
         ]
-    def _setup(self):
+    def _setup(self, training: bool = False):
         """Avoid instantiating unnecessary classes"""
         cfg = self.cfg
         if cfg.device:
@@ -46,10 +46,36 @@ class BaseSolver(object):
 
         self.model = cfg.model
 
+        # adapter-only 训练配置（SRFF-V1.2 §3.2）；默认关闭，普通训练路径完全不受影响。
+        self.adapter_cfg = self.cfg.yaml_cfg.get('adapter_only_training', {}) or {}
+        self.adapter_enabled = bool(self.adapter_cfg.get('enabled', False))
+        self.adapter_patterns = list(self.adapter_cfg.get('trainable_param_patterns', []) or [])
+        self._baseline_load_audit = None
+
         # NOTE: Must load_tuning_state before EMA instance building
         if self.cfg.tuning:
             print(f'Tuning checkpoint from {self.cfg.tuning}')
             self.load_tuning_state(self.cfg.tuning)
+
+        # adapter-only 冻结/审计仅在训练路径执行（train() 传 training=True）；评估（solver.eval()，
+        # 含 init-equiv 与 eval_metrics -r）不冻结，故 use_srff=False 的 baseline 模型也能正常构建。
+        if self.adapter_enabled and training:
+            from ..misc.adapter_freeze import audit_baseline_load, freeze_non_adapter, verify_trainable_set, sha256_file
+            if not self.cfg.tuning:
+                raise RuntimeError('adapter_only_training 训练需要 -t 指定原始 baseline checkpoint（禁止 -r 恢复 V1/V1.1）')
+            if self.cfg.resume:
+                raise RuntimeError('adapter_only_training 训练不支持同时 -r resume（§3.3）')
+            self._baseline_load_audit = audit_baseline_load(self.model, self.cfg.tuning, self.adapter_patterns)
+            tr, fz = freeze_non_adapter(self.model, self.adapter_patterns)
+            verify_trainable_set(self.model, self.adapter_patterns)
+            print(f'[adapter-only] baseline source={self._baseline_load_audit["source"]} '
+                  f'matched={self._baseline_load_audit["matched_count"]} '
+                  f'adapter_trainable={len(tr)} frozen_params={fz}')
+            try:
+                _cp = getattr(self.cfg, 'cfg_path', None)
+                self._config_sha256 = sha256_file(_cp) if _cp else None
+            except Exception:
+                self._config_sha256 = None
 
         self.model = dist_utils.warp_model(
             self.model.to(device), sync_bn=cfg.sync_bn, find_unused_parameters=cfg.find_unused_parameters
@@ -66,6 +92,12 @@ class BaseSolver(object):
 
         self.output_dir = Path(cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # adapter-only：写 baseline_load_audit.json（§3.3）
+        if self.adapter_enabled and self._baseline_load_audit is not None and dist_utils.is_main_process():
+            import json as _json
+            with open(self.output_dir / 'baseline_load_audit.json', 'w', encoding='utf-8') as f:
+                _json.dump(self._baseline_load_audit, f, ensure_ascii=False, indent=2)
+            print(f'[adapter-only] baseline_load_audit.json -> {self.output_dir}')
         self.writer = cfg.writer
 
         if self.writer:
@@ -78,7 +110,7 @@ class BaseSolver(object):
             atexit.register(self.writer.close)
 
     def train(self):
-        self._setup()
+        self._setup(training=True)
         self.optimizer = self.cfg.optimizer
         self.lr_scheduler = self.cfg.lr_scheduler
         self.lr_warmup_scheduler = self.cfg.lr_warmup_scheduler

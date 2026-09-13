@@ -33,3 +33,11 @@ HybridEncoder:
   srff_eps: 1.0e-6
   srff_global_threshold_low: 0.78
   srff_global_threshold_high: 0.80
+  # 三态门控（仅推理期诊断干预，不入 checkpoint）：auto=正常门控 / force_off=严格恒等 / force_on=严格走 V1。
+  # 默认 auto 保持已训练的 V1.1 行为；因果诊断时用 -u HybridEncoder.srff_global_gate_mode=... 临时切换。
+  srff_global_gate_mode: auto
+  # 局部门/双专家容量拆分的评估期诊断 override（默认 learned/0.02/learned = 不激活，逐位保持既有 V1.1 行为）。
+  # 容量实验用 -u 覆盖：local_gate_mode=constant + local_gate_value=α + router_mode=gaussian_only/trimmed_only，且 global_gate_mode=force_on。
+  srff_diagnostic_local_gate_mode: learned
+  srff_diagnostic_local_gate_value: 0.02
+  srff_diagnostic_router_mode: learned

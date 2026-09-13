@@ -370,6 +370,262 @@ def test_v11_has_fewer_params_than_v1():
 
 
 # ---------------------------------------------------------------------------
+# 三态门控因果干预（实现文档 §8 items 1-9）
+# ---------------------------------------------------------------------------
+def test_gate_mode_validation():
+    # item 6：非法 mode 明确报错；合法三态可构造
+    for ok in ('auto', 'force_off', 'force_on'):
+        SRFFV11(channels=8, global_gate_mode=ok)
+    for bad in ['off', 'on', 'AUTO', '', 'force', None]:
+        try:
+            SRFFV11(channels=8, global_gate_mode=bad)
+        except AssertionError:
+            continue
+        raise AssertionError(f'非法 mode 未被拒绝: {bad!r}')
+
+
+def test_three_modes_same_global_score_and_state_dict():
+    # item 4/5/9：三态 global_score/stationarity/pre_global_gate 相同；state dict 完全一致且不含 mode/tau
+    torch.manual_seed(0)
+    base = SRFFV11(channels=8)
+    high = torch.randn(2, 8, 12, 12)
+    low = torch.randn(2, 8, 24, 24)
+    blocks, outs = {}, {}
+    for mode in ('auto', 'force_off', 'force_on'):
+        b = SRFFV11(channels=8, global_gate_mode=mode)
+        b.load_state_dict(base.state_dict())
+        blocks[mode] = b
+        outs[mode] = b._core(high, low)
+    for mode in ('force_off', 'force_on'):
+        assert torch.equal(outs[mode]['global_score'], outs['auto']['global_score'])
+        assert torch.equal(outs[mode]['stationarity'], outs['auto']['stationarity'])
+        assert torch.allclose(outs[mode]['pre_global_gate'], outs['auto']['pre_global_gate'], atol=1e-6)
+    ref_keys = set(blocks['auto'].state_dict().keys())
+    for mode in ('force_off', 'force_on'):
+        assert set(blocks[mode].state_dict().keys()) == ref_keys
+    nparam = {m: sum(1 for _ in blocks[m].parameters()) for m in blocks}
+    nbuf = {m: sum(1 for _ in blocks[m].buffers()) for m in blocks}
+    assert len(set(nparam.values())) == 1 and len(set(nbuf.values())) == 1
+    assert not any(('global_gate_mode' in k or 'tau' in k or 'threshold' in k) for k in ref_keys)
+    # item 9：与 V1 同构，旧 V1.1 checkpoint key 集不因本补丁改变
+    assert ref_keys == set(SRFF(channels=8).state_dict().keys())
+
+
+def test_force_off_strict_identity():
+    # item 2：force_off 下 low_out 严格等于 low（同一张量），最终 gate 全 0
+    torch.manual_seed(0)
+    b = SRFFV11(channels=8, global_gate_mode='force_off')
+    high = torch.randn(2, 8, 12, 12)
+    low = torch.randn(2, 8, 24, 24)
+    out = b._core(high, low)
+    assert out['low_out'] is low
+    assert torch.equal(out['low_out'], low)
+    assert float(out['gate'].abs().max()) == 0.0
+    assert float(out['global_gate'].abs().max()) == 0.0
+    assert torch.equal(b(high, low), low)
+
+
+def test_force_on_strict_v1():
+    # item 3：force_on 下 low_out 严格等于父类 V1 输出（复用非重算），gate == pre_global_gate
+    torch.manual_seed(0)
+    v1 = SRFF(channels=8)
+    b = SRFFV11(channels=8, global_gate_mode='force_on')
+    b.load_state_dict(v1.state_dict())
+    high = torch.randn(2, 8, 12, 12)
+    low = torch.randn(2, 8, 24, 24)
+    out = b._core(high, low)
+    ov1 = v1._core(high, low)
+    assert torch.equal(out['low_out'], ov1['low_out'])
+    assert torch.equal(out['gate'], out['pre_global_gate'])
+    assert float(out['global_gate'].min()) == 1.0
+    assert torch.equal(b(high, low), ov1['low_out'])
+
+
+def test_auto_matches_original_formula():
+    # item 1：auto 与修改前公式一致（gate=pre*m，low_out=low+m*(v1_low-low)）
+    torch.manual_seed(0)
+    b = SRFFV11(channels=8, global_gate_mode='auto')
+    high = torch.randn(2, 8, 12, 12)
+    low = torch.randn(2, 8, 24, 24)
+    out = b._core(high, low)
+    assert torch.allclose(out['gate'], out['pre_global_gate'] * out['global_gate'], atol=1e-6)
+    v1 = SRFF(channels=8)
+    v1.load_state_dict(b.state_dict())
+    v1_low = v1._core(high, low)['low_out']
+    recon = low + out['global_gate'] * (v1_low - low)
+    assert torch.allclose(out['low_out'], recon, atol=1e-5)
+
+
+def test_encoder_passes_gate_mode():
+    # item 7/8：HybridEncoder 向 active block 传递 mode；inactive P4→P3 仍为 Identity/baseline
+    HybridEncoder = _import_hybrid_encoder()
+    for mode in ('auto', 'force_off', 'force_on'):
+        enc = HybridEncoder(**_small_enc_kwargs(use_srff=True, srff_version='v1_1',
+                                                srff_active_levels=[0], srff_global_gate_mode=mode))
+        assert enc.srff_blocks[0].global_gate_mode == mode
+        assert isinstance(enc.srff_blocks[1], torch.nn.Identity)
+    try:
+        HybridEncoder(**_small_enc_kwargs(use_srff=True, srff_version='v1_1',
+                                          srff_active_levels=[0], srff_global_gate_mode='bad'))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('encoder 未拒绝非法 srff_global_gate_mode')
+
+
+# ---------------------------------------------------------------------------
+# 局部门 / 双专家容量诊断 override（实现文档 §8 items 1-10）
+# ---------------------------------------------------------------------------
+def _hl(c=8):
+    return torch.randn(2, c, 12, 12), torch.randn(2, c, 24, 24)
+
+
+def test_diag_default_preserves_auto():
+    # item 1：默认 diagnostic 字段（learned/0.02/learned）不改变旧 V1.1 auto 输出
+    torch.manual_seed(0)
+    b = SRFFV11(channels=8)
+    high, low = _hl()
+    out = b._core(high, low)
+    assert out['diagnostic_override_active'] is False
+    v1 = SRFF(channels=8)
+    v1.load_state_dict(b.state_dict())
+    ov1 = v1._core(high, low)
+    m = out['global_gate']
+    assert torch.allclose(out['low_out'], low + m * (ov1['low_out'] - low), atol=1e-5)
+    assert torch.allclose(out['gate'], out['pre_global_gate'] * m, atol=1e-6)
+    assert torch.equal(out['learned_gaussian_weight'], ov1['gaussian_weight'])
+    assert torch.equal(out['learned_trimmed_weight'], ov1['trimmed_weight'])
+    assert torch.equal(out['learned_local_gate'], ov1['gate'])
+
+
+def test_diag_training_override_raises():
+    # item 2：训练模式激活 override 必然报错（含固定字样）；eval 不报错
+    high, low = _hl()
+    for kwargs in ({'diagnostic_local_gate_mode': 'constant'},
+                   {'diagnostic_router_mode': 'gaussian_only'}):
+        b = SRFFV11(channels=8, global_gate_mode='force_on', **kwargs)
+        b.train()
+        try:
+            b(high, low)
+        except RuntimeError as e:
+            assert 'diagnostic override is evaluation-only' in str(e)
+        else:
+            raise AssertionError(f'训练期 override 未报错: {kwargs}')
+    b = SRFFV11(channels=8, global_gate_mode='force_on', diagnostic_local_gate_mode='constant')
+    b.eval()
+    b(high, low)
+
+
+def test_diag_constant_local_gate_exact():
+    # item 3：constant=0.02/0.05/0.10 产生逐元素常数 local gate（final gate 也等于 α）
+    for alpha in (0.02, 0.05, 0.10):
+        b = SRFFV11(channels=8, global_gate_mode='force_on',
+                    diagnostic_local_gate_mode='constant', diagnostic_local_gate_value=alpha)
+        b.eval()
+        out = b._core(*_hl())
+        assert out['diagnostic_override_active'] is True
+        assert torch.all(out['local_gate_used'] == alpha)
+        assert torch.all(out['gate'] == alpha)   # global_gate(force_on)=1 → final_gate=α
+
+
+def test_diag_gaussian_only_weights():
+    # item 4：gaussian-only 实际权重严格 1/0，learned 原值保留
+    torch.manual_seed(0)
+    b = SRFFV11(channels=8, global_gate_mode='force_on', diagnostic_router_mode='gaussian_only',
+                diagnostic_local_gate_mode='constant', diagnostic_local_gate_value=0.05)
+    b.eval()
+    high, low = _hl()
+    out = b._core(high, low)
+    assert torch.all(out['gaussian_weight'] == 1.0) and torch.all(out['trimmed_weight'] == 0.0)
+    v1 = SRFF(channels=8)
+    v1.load_state_dict(b.state_dict())
+    ov1 = v1._core(high, low)
+    assert torch.equal(out['learned_gaussian_weight'], ov1['gaussian_weight'])
+    assert not torch.all(out['learned_gaussian_weight'] == 1.0)
+
+
+def test_diag_trimmed_only_weights():
+    # item 5：trimmed-only 实际权重严格 0/1
+    b = SRFFV11(channels=8, global_gate_mode='force_on', diagnostic_router_mode='trimmed_only',
+                diagnostic_local_gate_mode='constant', diagnostic_local_gate_value=0.05)
+    b.eval()
+    out = b._core(*_hl())
+    assert torch.all(out['gaussian_weight'] == 0.0) and torch.all(out['trimmed_weight'] == 1.0)
+
+
+def test_diag_learned_router_keeps_weights():
+    # item 6：learned router 保持原权重（仅 local gate 被 override）
+    b = SRFFV11(channels=8, global_gate_mode='force_on', diagnostic_local_gate_mode='constant',
+                diagnostic_local_gate_value=0.05, diagnostic_router_mode='learned')
+    b.eval()
+    out = b._core(*_hl())
+    assert out['diagnostic_override_active'] is True
+    assert torch.equal(out['gaussian_weight'], out['learned_gaussian_weight'])
+    assert torch.equal(out['trimmed_weight'], out['learned_trimmed_weight'])
+
+
+def test_diag_override_output_formula():
+    # item 7：override 输出严格满足 low + α*(f_rob_used - low)（gaussian_only → f_rob_used=g_low）
+    torch.manual_seed(0)
+    alpha = 0.05
+    b = SRFFV11(channels=8, global_gate_mode='force_on', diagnostic_local_gate_mode='constant',
+                diagnostic_local_gate_value=alpha, diagnostic_router_mode='gaussian_only')
+    b.eval()
+    high, low = _hl()
+    out = b._core(high, low)
+    v1 = SRFF(channels=8)
+    v1.load_state_dict(b.state_dict())
+    g_low = v1._core(high, low)['gaussian_low']
+    expect = low + alpha * (g_low - low)   # global_gate=1
+    assert torch.allclose(out['low_out'], expect, atol=1e-5)
+
+
+def test_diag_override_requires_force_on():
+    # item 8：global mode 非 force_on 时激活 override 被拒绝
+    for gmode in ('auto', 'force_off'):
+        b = SRFFV11(channels=8, global_gate_mode=gmode,
+                    diagnostic_local_gate_mode='constant', diagnostic_local_gate_value=0.05)
+        b.eval()
+        try:
+            b._core(*_hl())
+        except RuntimeError as e:
+            assert 'force_on' in str(e)
+        else:
+            raise AssertionError(f'{gmode} + override 未报错')
+
+
+def test_diag_state_dict_unchanged():
+    # item 9：三种 router × 三种 α 不改变 state dict / 参数数 / buffer 数
+    ref = SRFFV11(channels=8)
+    ref_keys = set(ref.state_dict().keys())
+    ref_np = sum(1 for _ in ref.parameters())
+    ref_nb = sum(1 for _ in ref.buffers())
+    for router in ('learned', 'gaussian_only', 'trimmed_only'):
+        for alpha in (0.02, 0.05, 0.10):
+            b = SRFFV11(channels=8, global_gate_mode='force_on',
+                        diagnostic_local_gate_mode='constant', diagnostic_local_gate_value=alpha,
+                        diagnostic_router_mode=router)
+            assert set(b.state_dict().keys()) == ref_keys
+            assert sum(1 for _ in b.parameters()) == ref_np
+            assert sum(1 for _ in b.buffers()) == ref_nb
+    # 诊断属性不入 state dict（router_net.* 是 V1 合法参数，故只查 diagnostic/tau/global_gate_mode）
+    assert not any(('diagnostic' in k or 'tau' in k or 'global_gate_mode' in k) for k in ref_keys)
+
+
+def test_diag_v1_baseline_unaffected():
+    # item 10：V1 类无 diagnostic 字段；v1/baseline encoder 路径不受影响
+    v1 = SRFF(channels=8)
+    out = v1._core(*_hl())
+    assert 'diagnostic_override_active' not in out
+    HybridEncoder = _import_hybrid_encoder()
+    enc0 = HybridEncoder(**_small_enc_kwargs(use_srff=False))
+    assert enc0.srff_blocks is None
+    enc1 = HybridEncoder(**_small_enc_kwargs(use_srff=True, srff_version='v1',
+                                             srff_diagnostic_router_mode='gaussian_only'))
+    assert not hasattr(enc1.srff_blocks[0], 'diagnostic_router_mode')
+
+
+# ---------------------------------------------------------------------------
 # 独立运行入口
 # ---------------------------------------------------------------------------
 def _run_all():

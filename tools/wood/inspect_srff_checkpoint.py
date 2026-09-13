@@ -1024,6 +1024,9 @@ def run(args):
             'val_img_folder': str(img_folder), 'val_ann_file': str(ann_path),
             'srff_version': srff_version, 'srff_active_levels': active_levels_cfg,
             'srff_active_block_count': nblocks,
+            'srff_global_gate_mode': he.get('srff_global_gate_mode', 'auto'),
+            'srff_global_threshold_low': he.get('srff_global_threshold_low', None),
+            'srff_global_threshold_high': he.get('srff_global_threshold_high', None),
             'num_images': total_images, 'num_batches': total_batches,
             'partial_run': partial, 'max_images': args.max_images,
             'histogram': {

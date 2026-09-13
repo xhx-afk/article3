@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from .utils import get_activation
 from .srff import SelectiveRobustFrequencyFusion
 from .srff_v1_1 import SelectiveRobustFrequencyFusionV11
+from .srff_v1_2 import FrozenBaseEvidenceConditionedResidualAdapter
 
 from ..core import register
 
@@ -312,6 +313,18 @@ class HybridEncoder(nn.Module):
                  srff_active_levels=None,
                  srff_global_threshold_low=0.78,
                  srff_global_threshold_high=0.80,
+                 srff_global_gate_mode='auto',
+                 srff_diagnostic_local_gate_mode='learned',
+                 srff_diagnostic_local_gate_value=0.02,
+                 srff_diagnostic_router_mode='learned',
+                 srff_active_blocks=None,
+                 srff_bottleneck_channels=64,
+                 srff_alpha_max=0.10,
+                 srff_global_tau=None,
+                 srff_router_threshold_init=0.0,
+                 srff_router_temperature_init=0.25,
+                 srff_gate_mode='auto',
+                 srff_expert_mode='dual',
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -384,12 +397,14 @@ class HybridEncoder(nn.Module):
         self.srff_version = srff_version
         num_srff_levels = len(in_channels) - 1
         if use_srff:
-            if srff_active_levels is None:
+            # V1.2 用 srff_active_blocks；V1/V1.1 用 srff_active_levels（语义相同：启用的 module_idx）
+            active_src = srff_active_blocks if srff_active_blocks is not None else srff_active_levels
+            if active_src is None:
                 active_levels = list(range(num_srff_levels))
             else:
-                active_levels = [int(x) for x in srff_active_levels]
+                active_levels = [int(x) for x in active_src]
                 assert len(active_levels) == len(set(active_levels)), \
-                    f'srff_active_levels 必须唯一: {srff_active_levels}'
+                    f'srff active levels 必须唯一: {active_src}'
                 for a in active_levels:
                     assert 0 <= a <= num_srff_levels - 1, \
                         f'非法 srff active level {a}，必须在 [0, {num_srff_levels - 1}]'
@@ -407,9 +422,24 @@ class HybridEncoder(nn.Module):
                         trim_kernel=srff_trim_kernel, gate_hidden=srff_gate_hidden,
                         gate_init_bias=srff_gate_init_bias, eps=srff_eps,
                         global_threshold_low=srff_global_threshold_low,
-                        global_threshold_high=srff_global_threshold_high)
+                        global_threshold_high=srff_global_threshold_high,
+                        global_gate_mode=srff_global_gate_mode,
+                        diagnostic_local_gate_mode=srff_diagnostic_local_gate_mode,
+                        diagnostic_local_gate_value=srff_diagnostic_local_gate_value,
+                        diagnostic_router_mode=srff_diagnostic_router_mode)
+            elif srff_version == 'v1_2':
+                _tau = tuple(srff_global_tau) if srff_global_tau is not None else (0.78, 0.80)
+                def _make_srff_block():
+                    return FrozenBaseEvidenceConditionedResidualAdapter(
+                        channels=hidden_dim, bottleneck_channels=srff_bottleneck_channels,
+                        alpha_max=srff_alpha_max, global_tau=_tau,
+                        router_threshold_init=srff_router_threshold_init,
+                        router_temperature_init=srff_router_temperature_init,
+                        gate_mode=srff_gate_mode, expert_mode=srff_expert_mode,
+                        gaussian_kernel=srff_gaussian_kernel, trim_kernel=srff_trim_kernel,
+                        eps=srff_eps)
             else:
-                raise ValueError(f'未知 srff_version={srff_version!r}，仅支持 "v1" / "v1_1"')
+                raise ValueError(f'未知 srff_version={srff_version!r}，仅支持 "v1" / "v1_1" / "v1_2"')
             self.srff_blocks = nn.ModuleList([
                 _make_srff_block() if idx in active_levels else nn.Identity()
                 for idx in range(num_srff_levels)

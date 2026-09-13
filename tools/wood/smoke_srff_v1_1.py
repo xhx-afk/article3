@@ -183,6 +183,92 @@ def main():
     print(f'  [{"OK" if no_meta else "FAIL"}] forward/_core 仅接受 (high, low)：{sig_fwd} / {sig_core}')
     ok = ok and no_meta
 
+    # ---- 2b. 三态门控模式（auto/force_off/force_on，推理期因果干预）----
+    header('2b. 三态门控模式：auto / force_off / force_on')
+    torch.manual_seed(args.seed)
+    ref = SelectiveRobustFrequencyFusionV11(channels=16).to(device)
+    v1_ref = SelectiveRobustFrequencyFusion(channels=16).to(device)
+    v1_ref.load_state_dict(ref.state_dict())
+    hi = torch.randn(2, 16, 12, 12, device=device)
+    lo = torch.randn(2, 16, 24, 24, device=device)
+    v1_out = v1_ref._core(hi, lo)['low_out']
+    mode_blocks = {}
+    for mode in ('auto', 'force_off', 'force_on'):
+        bm = SelectiveRobustFrequencyFusionV11(channels=16, global_gate_mode=mode).to(device)
+        bm.load_state_dict(ref.state_dict())
+        mode_blocks[mode] = bm
+        om = bm._core(hi, lo)
+        gg = om['global_gate']
+        print(f'  [{mode:9s}] global_gate min/max={float(gg.min()):.4f}/{float(gg.max()):.4f}  '
+              f'gate_max={float(om["gate"].max()):.5f}  rel_change={rel_change(om["low_out"], lo):.5f}')
+    off = mode_blocks['force_off']._core(hi, lo)
+    off_id = (off['low_out'] is lo) and float(off['gate'].abs().max()) == 0.0 \
+        and float(off['global_gate'].abs().max()) == 0.0
+    print(f'  [{"OK" if off_id else "FAIL"}] force_off: low_out is low 且 gate/global_gate 全 0')
+    ok = ok and off_id
+    on = mode_blocks['force_on']._core(hi, lo)
+    on_v1 = torch.equal(on['low_out'], v1_out) and torch.equal(on['gate'], on['pre_global_gate']) \
+        and float(on['global_gate'].min()) == 1.0
+    print(f'  [{"OK" if on_v1 else "FAIL"}] force_on: low_out 严格等于 V1 输出 且 gate==pre_global_gate')
+    ok = ok and on_v1
+    sd_keys = {m: set(b.state_dict().keys()) for m, b in mode_blocks.items()}
+    same_sd = sd_keys['auto'] == sd_keys['force_off'] == sd_keys['force_on']
+    no_mode_key = not any(('global_gate_mode' in k or 'tau' in k) for k in sd_keys['auto'])
+    nparam = {m: sum(1 for _ in b.parameters()) for m, b in mode_blocks.items()}
+    same_param = len(set(nparam.values())) == 1
+    print(f'  [{"OK" if same_sd else "FAIL"}] 三态 state_dict key 完全一致')
+    print(f'  [{"OK" if no_mode_key else "FAIL"}] state_dict 不含 mode/tau（未新增 checkpoint 项）')
+    print(f'  [{"OK" if same_param else "FAIL"}] 三态参数数一致={list(nparam.values())[0]}')
+    ok = ok and same_sd and no_mode_key and same_param
+
+    # ---- 2c. 局部门/双专家容量诊断 override（constant α / gaussian_only / trimmed_only）----
+    header('2c. 诊断 override：constant α / 强制专家 / 训练硬阻断')
+    torch.manual_seed(args.seed)
+    ref2 = SelectiveRobustFrequencyFusionV11(channels=16).to(device)
+    v1_ref2 = SelectiveRobustFrequencyFusion(channels=16).to(device)
+    v1_ref2.load_state_dict(ref2.state_dict())
+    hi2 = torch.randn(2, 16, 12, 12, device=device)
+    lo2 = torch.randn(2, 16, 24, 24, device=device)
+
+    def _mk(**kw):
+        b = SelectiveRobustFrequencyFusionV11(channels=16, global_gate_mode='force_on', **kw).to(device)
+        b.load_state_dict(ref2.state_dict())
+        b.eval()
+        return b
+
+    alpha_ok = True
+    for alpha in (0.02, 0.05, 0.10):
+        o = _mk(diagnostic_local_gate_mode='constant', diagnostic_local_gate_value=alpha)._core(hi2, lo2)
+        c1 = bool(torch.all(o['local_gate_used'] == alpha)) and bool(torch.all(o['gate'] == alpha))
+        alpha_ok = alpha_ok and c1 and bool(o['diagnostic_override_active'])
+        print(f'  [{"OK" if c1 else "FAIL"}] α={alpha:.2f}：local_gate_used/gate 逐元素==α')
+    ok = ok and alpha_ok
+    og = _mk(diagnostic_router_mode='gaussian_only', diagnostic_local_gate_mode='constant',
+             diagnostic_local_gate_value=0.05)._core(hi2, lo2)
+    g_ok = bool(torch.all(og['gaussian_weight'] == 1.0)) and bool(torch.all(og['trimmed_weight'] == 0.0))
+    ot = _mk(diagnostic_router_mode='trimmed_only', diagnostic_local_gate_mode='constant',
+             diagnostic_local_gate_value=0.05)._core(hi2, lo2)
+    t_ok = bool(torch.all(ot['gaussian_weight'] == 0.0)) and bool(torch.all(ot['trimmed_weight'] == 1.0))
+    print(f'  [{"OK" if g_ok else "FAIL"}] gaussian_only：权重严格 1/0')
+    print(f'  [{"OK" if t_ok else "FAIL"}] trimmed_only：权重严格 0/1')
+    ok = ok and g_ok and t_ok
+    g_low = v1_ref2._core(hi2, lo2)['gaussian_low']
+    f_ok = bool(torch.allclose(og['low_out'], lo2 + 0.05 * (g_low - lo2), atol=1e-5))
+    print(f'  [{"OK" if f_ok else "FAIL"}] override 输出严格=low+α*(g_low-low)')
+    ok = ok and f_ok
+    tb = _mk(diagnostic_local_gate_mode='constant', diagnostic_local_gate_value=0.05)
+    tb.train()
+    try:
+        tb(hi2, lo2)
+        tr_ok = False
+    except RuntimeError as e:
+        tr_ok = 'diagnostic override is evaluation-only' in str(e)
+    print(f'  [{"OK" if tr_ok else "FAIL"}] 训练期 override 抛 RuntimeError(evaluation-only)')
+    ok = ok and tr_ok
+    sd_ok = set(_mk(diagnostic_router_mode='gaussian_only').state_dict().keys()) == set(ref2.state_dict().keys())
+    print(f'  [{"OK" if sd_ok else "FAIL"}] override 不改变 state_dict key')
+    ok = ok and sd_ok
+
     # ---- 3. 前后向 + shape/dtype/finite（FP32）----
     header('3. encoder 前后向（FP32, batch=2, P3=40）：shape/dtype/finite')
     feats = make_feats(2, 40, device)

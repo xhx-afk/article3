@@ -1,0 +1,75 @@
+# SRFF-V1.2（冻结基线 + 可学习双专家残差适配器）fast36 adapter pilot / seed0
+# ---------------------------------------------------------------------------
+# 依据 SRFF-V1.2-冻结基线可学习双专家适配器-实现文档-Agent.md §2.1 / §3.2 / §4。
+# 只在 fast72 baseline 的数据/模型/batch/评估之上改：调度→36ep、adapter-only 训练、V1.2 encoder block。
+#
+# 训练（单卡或双卡，务必用 -t 加载原始 baseline best_stg2.pth，禁止 -r 恢复 V1/V1.1）：
+#   python train.py -c configs/deim_dfine/custom/coated_wood_fast_s_srff_v1_2.yml \
+#     -t <baseline>/best_stg2.pth --use-amp --seed 0
+#
+# 科学性约束：adapter off 必须严格还原 baseline；只训 encoder.srff_blocks.0；共享网络全部冻结。
+# ---------------------------------------------------------------------------
+
+__include__: ["./coated_wood_fast_s.yml"]
+
+output_dir: ./deim_outputs/coated_wood_fast/srff_v1_2/deim_s_640_adapter_e36_seed0
+
+# ---- fast36 调度（覆盖 fast72；四处锚点保持一致：stop=28=36-8，middle=16，start=2）----
+epoches: 36
+flat_epoch: 16
+no_aug_epoch: 8
+warmup_iter: 200
+lr_gamma: 0.5
+checkpoint_freq: 12
+# §3.4：共享网络已由 baseline EMA 权重初始化，训练期只更新小 adapter；关闭 EMA 避免 checkpoint 身份歧义。
+use_ema: false
+
+# ---- optimizer：只训 adapter ----
+# 基线 optimizer 用 params 组（backbone 倍率 / norm-bn 无 wd）。adapter-only 下用单一白名单组替换：
+# 冻结后仅 encoder.srff_blocks.0.* 的 requires_grad=True，get_optim_params 便只收集 adapter 参数。
+# pattern 用子串（不带 ^）以兼容 DDP 的 module. 前缀。
+optimizer:
+  type: AdamW
+  lr: 0.0005
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  params:
+    - params: 'srff_blocks\.0\.'
+      lr: 0.0005
+      weight_decay: 0.0001
+
+# ---- 数据增强调度锚点（fast36）----
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        epoch: [2, 16, 28]
+  collate_fn:
+    mixup_epochs: [2, 16]
+    stop_epoch: 28
+
+# ---- V1.2 adapter：只在 P5→P4（block0）启用；P4→P3 不启用 ----
+HybridEncoder:
+  use_srff: True
+  srff_version: v1_2
+  srff_active_blocks: [0]
+  srff_bottleneck_channels: 64
+  srff_alpha_max: 0.10
+  srff_global_tau: [0.78, 0.80]
+  srff_router_threshold_init: 0.0
+  srff_router_temperature_init: 0.25
+  srff_gate_mode: auto
+  srff_expert_mode: dual
+  srff_gaussian_kernel: 5
+  srff_trim_kernel: 3
+  srff_eps: 1.0e-6
+
+# ---- adapter-only 训练语义（§3.2）----
+# trainable_param_patterns 用 ^ 锚定（冻结在 DDP 包装前、无 module. 前缀时执行）。
+adapter_only_training:
+  enabled: true
+  trainable_param_patterns:
+    - '^encoder\.srff_blocks\.0\.'
+  frozen_eval: true
+  verify_each_epoch: true
+  skip_stage_restart: true
